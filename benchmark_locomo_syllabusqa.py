@@ -6,22 +6,6 @@ Measures:
   - F1 score, Recall, Accuracy  (QA quality)
   - Insert / Query / Delete time (seconds)
   - Insert / Query / Delete token cost (via tiktoken cl100k_base)
-
-Usage (small sample):
-  python benchmark_locomo_syllabusqa.py \
-      --dataset all \
-      --sample-size 10 \
-      --llm-model gpt-4o-mini \
-      --embedding-model text-embedding-3-small \
-      --api-key YOUR_KEY
-
-Usage (full):
-  python benchmark_locomo_syllabusqa.py \
-      --dataset all \
-      --sample-size 0 \
-      --llm-model gpt-4o-mini \
-      --embedding-model text-embedding-3-small \
-      --api-key YOUR_KEY
 """
 
 from __future__ import annotations
@@ -330,9 +314,49 @@ def compute_accuracy(prediction: str, answer: str) -> float:
 # Dataset loaders
 # ---------------------------------------------------------------------------
 
+def _filter_docs(
+    results: list[dict],
+    doc_ids: list[str] | None,
+    max_qa: int,
+) -> list[dict]:
+    """Filter and truncate loaded documents.
+
+    Args:
+        results: Full list of loaded docs.
+        doc_ids: Explicit doc IDs or 0-based indices to keep. None = all.
+        max_qa: Max QA pairs per doc (0 = all).
+    """
+    if doc_ids:
+        id_set = set(doc_ids)
+        idx_set: set[int] = set()
+        for v in doc_ids:
+            try:
+                idx_set.add(int(v))
+            except ValueError:
+                pass
+        filtered = [
+            r
+            for i, r in enumerate(results)
+            if r["doc_id"] in id_set or i in idx_set
+        ]
+        if not filtered:
+            available = [r["doc_id"] for r in results]
+            logger.warning(
+                f"No docs matched --doc-ids {doc_ids}. Available: {available}"
+            )
+        results = filtered
+
+    if max_qa > 0:
+        for r in results:
+            if len(r["qa_pairs"]) > max_qa:
+                r["qa_pairs"] = r["qa_pairs"][:max_qa]
+    return results
+
+
 def load_locomo(
     data_path: str = "/home/wiang/locomo/data/locomo10.json",
-    sample_size: int = 0,
+    doc_ids: list[str] | None = None,
+    max_qa: int = 0,
 ) -> list[dict]:
     """Return list of dicts: {doc_id, doc_text, qa_pairs: [{question, answer, category}]}"""
     raw = json.loads(Path(data_path).read_text())
@@ -374,18 +398,14 @@ def load_locomo(
             }
         )
 
-    if sample_size > 0:
-        results = results[:sample_size]
-        for r in results:
-            if sample_size < len(r["qa_pairs"]):
-                r["qa_pairs"] = r["qa_pairs"][:sample_size]
-    return results
+    return _filter_docs(results, doc_ids, max_qa)
 
 
 def load_syllabusqa(
     data_path: str = "/home/wiang/SyllabusQA/data/dataset_split/test.json",
     syllabi_dir: str = "/home/wiang/SyllabusQA/syllabi/syllabi_redacted/text",
-    sample_size: int = 0,
+    doc_ids: list[str] | None = None,
+    max_qa: int = 0,
 ) -> list[dict]:
     """Return list of dicts: {doc_id, doc_text, qa_pairs: [{question, answer, category}]}"""
     raw = json.loads(Path(data_path).read_text())
@@ -421,12 +441,7 @@ def load_syllabusqa(
             }
         )
 
-    if sample_size > 0:
-        results = results[:sample_size]
-        for r in results:
-            if sample_size < len(r["qa_pairs"]):
-                r["qa_pairs"] = r["qa_pairs"][:sample_size]
-    return results
+    return _filter_docs(results, doc_ids, max_qa)
 
 
 # ---------------------------------------------------------------------------
@@ -510,6 +525,7 @@ async def _run_query_mode(
     docs: list[dict],
     mode: str,
     dataset_name: str,
+    enable_rerank: bool = False,
 ) -> tuple[dict, PhaseMetrics]:
     """Run all QA queries under a single query mode and return aggregated results + metrics."""
     GLOBAL_TRACKER.reset()
@@ -525,7 +541,7 @@ async def _run_query_mode(
             try:
                 pred = await rag.aquery(
                     question,
-                    param=QueryParam(mode=mode),
+                    param=QueryParam(mode=mode, enable_rerank=enable_rerank),
                 )
                 if pred is None:
                     pred = ""
@@ -634,7 +650,9 @@ async def run_benchmark_for_dataset(
     query_results: dict[str, dict] = {}
     for mode in query_modes:
         logger.info(f"--- Query mode: {mode} ---")
-        agg, metrics = await _run_query_mode(rag, docs, mode, dataset_name)
+        agg, metrics = await _run_query_mode(
+            rag, docs, mode, dataset_name, enable_rerank=args.enable_rerank
+        )
         query_results[mode] = {
             **agg,
             "time_sec": round(metrics.elapsed_sec, 3),
@@ -728,16 +746,24 @@ def parse_args():
 
     p.add_argument(
         "--dataset",
-        choices=["locomo", "syllabusqa", "all"],
-        default="all",
-        help="Which dataset to benchmark",
+        nargs="+",
+        choices=["locomo", "syllabusqa"],
+        default=["locomo", "syllabusqa"],
+        help="Datasets to benchmark (default: both). Example: --dataset locomo syllabusqa",
     )
     p.add_argument(
-        "--sample-size",
+        "--doc-ids",
+        nargs="+",
+        default=None,
+        help="Specific doc IDs or 0-based indices to test. "
+        "LoCoMo IDs: conv-26 .. conv-50; SyllabusQA IDs: syllabus names. "
+        "Example: --doc-ids conv-26 conv-42  or  --doc-ids 0 3",
+    )
+    p.add_argument(
+        "--max-qa",
         type=int,
-        default=10,
-        help="Number of docs (LoCoMo) or syllabi (SyllabusQA) to use. "
-        "Also limits QA pairs per doc when < total. 0 = full dataset.",
+        default=0,
+        help="Max QA pairs per doc (0 = all). Use to limit QA independently of --sample-size.",
     )
     p.add_argument(
         "--query-modes",
@@ -759,6 +785,13 @@ def parse_args():
         help="Use volcengine multimodal embedding API (/embeddings/multimodal) "
         "instead of standard OpenAI /embeddings. Required for doubao-embedding-vision.",
     )
+    p.add_argument(
+        "--enable-rerank",
+        action="store_true",
+        default=False,
+        help="Enable reranking during query (requires a rerank model configured in LightRAG). "
+        "Default: disabled to avoid warnings.",
+    )
 
     p.add_argument("--locomo-path", default="/home/wiang/locomo/data/locomo10.json")
     p.add_argument("--syllabusqa-path", default="/home/wiang/SyllabusQA/data/dataset_split/test.json")
@@ -774,21 +807,31 @@ async def async_main(args):
     os.makedirs(args.output_dir, exist_ok=True)
     all_summaries = []
 
-    if args.dataset in ("locomo", "all"):
-        docs = load_locomo(args.locomo_path, args.sample_size)
-        total_qa = sum(len(d["qa_pairs"]) for d in docs)
-        logger.info(f"LoCoMo: {len(docs)} docs, {total_qa} QA pairs")
-        summary = await run_benchmark_for_dataset("locomo", docs, args)
-        print_summary(summary)
-        all_summaries.append(summary)
+    for ds in args.dataset:
+        if ds == "locomo":
+            docs = load_locomo(
+                args.locomo_path,
+                doc_ids=args.doc_ids,
+                max_qa=args.max_qa,
+            )
+            total_qa = sum(len(d["qa_pairs"]) for d in docs)
+            logger.info(f"LoCoMo: {len(docs)} docs, {total_qa} QA pairs")
+        elif ds == "syllabusqa":
+            docs = load_syllabusqa(
+                args.syllabusqa_path,
+                args.syllabi_dir,
+                doc_ids=args.doc_ids,
+                max_qa=args.max_qa,
+            )
+            total_qa = sum(len(d["qa_pairs"]) for d in docs)
+            logger.info(f"SyllabusQA: {len(docs)} docs, {total_qa} QA pairs")
+        else:
+            continue
 
-    if args.dataset in ("syllabusqa", "all"):
-        docs = load_syllabusqa(args.syllabusqa_path, args.syllabi_dir, args.sample_size)
-        total_qa = sum(len(d["qa_pairs"]) for d in docs)
-        logger.info(f"SyllabusQA: {len(docs)} docs, {total_qa} QA pairs")
-        summary = await run_benchmark_for_dataset("syllabusqa", docs, args)
-        print_summary(summary)
-        all_summaries.append(summary)
+        if docs:
+            summary = await run_benchmark_for_dataset(ds, docs, args)
+            print_summary(summary)
+            all_summaries.append(summary)
 
     out_path = args.output_json or os.path.join(args.output_dir, "results.json")
     Path(out_path).write_text(json.dumps(all_summaries, indent=2, ensure_ascii=False))
