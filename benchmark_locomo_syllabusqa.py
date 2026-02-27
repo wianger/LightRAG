@@ -450,7 +450,7 @@ async def llm_grader(
     gold_answer: str,
     response: str,
     dataset_name: str = "Locomo",
-) -> bool:
+) -> float:
     # 1. 根据 dataset_name 路由选择 Prompt
     if "Locomo" in dataset_name.lower():
         system_prompt = """
@@ -503,21 +503,21 @@ async def llm_grader(
         First, provide a short (one sentence) explanation of your reasoning, then finish with CORRECT or WRONG.
         Respond with JSON only: {{"is_correct": "CORRECT" or "WRONG", "reasoning": "your explanation"}}
         """
-    content = await tracked_llm_complete(
-        prompt=ACCURACY_PROMPT,
+    content = await openai_complete_if_cache(
+        _model_name,
+        ACCURACY_PROMPT,
         system_prompt=system_prompt,
-        _model_name=_model_name,
-        _base_url=_base_url,
-        _api_key=_api_key,
+        base_url=_base_url,
+        api_key=_api_key
     )
 
     try:
         result = json.loads(content)
         label = result.get("is_correct", result.get("label", "WRONG"))
-        return label.strip().lower() == "correct"
+        return 1.0 if label.strip().lower() == "correct" else 0.0
     except json.JSONDecodeError:
         # 容错：防止 LLM 没按格式输出 JSON
-        return "CORRECT" in content.upper()
+        return 1.0 if "CORRECT" in content.upper() else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -587,7 +587,8 @@ def load_locomo(
         for qa in item["qa"]:
             category = qa.get("category", 1)
             if category == 5:
-                answer = qa.get("adversarial_answer", qa.get("answer", ""))
+                # answer = qa.get("adversarial_answer", qa.get("answer", ""))
+                continue  # Skip category 5 (adversarial) for now since it's not clear how to evaluate it with LLM grading
             else:
                 answer = qa.get("answer", "")
             qa_pairs.append(
@@ -1092,13 +1093,13 @@ def parse_args():
         help="Min rerank score threshold (default: 0.1)",
     )
 
-    p.add_argument("--locomo-path", default="/home/wiang/locomo/data/locomo10.json")
+    p.add_argument("--locomo-path", default="./datas/locomo/data/locomo10.json")
     p.add_argument(
         "--syllabusqa-path",
-        default="/home/wiang/SyllabusQA/data/dataset_split/test.json",
+        default="./datas/SyllabusQA/data/dataset_split/test.json",
     )
     p.add_argument(
-        "--syllabi-dir", default="/home/wiang/SyllabusQA/syllabi/syllabi_redacted/text"
+        "--syllabi-dir", default="./datas/SyllabusQA/syllabi/syllabi_redacted/text"
     )
 
     p.add_argument(
