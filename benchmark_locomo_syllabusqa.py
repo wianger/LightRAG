@@ -561,7 +561,7 @@ def _filter_docs(
 
 
 def load_locomo(
-    data_path: str = "/home/wiang/locomo/data/locomo10.json",
+    data_path: str = "./datas/locomo/data/locomo10.json",
     doc_ids: list[str] | None = None,
     max_qa: int = 0,
 ) -> list[dict]:
@@ -609,8 +609,8 @@ def load_locomo(
 
 
 def load_syllabusqa(
-    data_path: str = "/home/wiang/SyllabusQA/data/dataset_split/test.json",
-    syllabi_dir: str = "/home/wiang/SyllabusQA/syllabi/syllabi_redacted/text",
+    data_path: str = "./datas/SyllabusQA/data/dataset_split/test.json",
+    syllabi_dir: str = "./datas/SyllabusQA/syllabi/syllabi_redacted/text",
     doc_ids: list[str] | None = None,
     max_qa: int = 0,
 ) -> list[dict]:

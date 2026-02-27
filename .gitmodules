@@ -1,0 +1,6 @@
+[submodule "datas/locomo"]
+	path = datas/locomo
+	url = https://github.com/snap-research/locomo.git
+[submodule "datas/SyllabusQA"]
+	path = datas/SyllabusQA
+	url = https://github.com/umass-ml4ed/SyllabusQA.git
