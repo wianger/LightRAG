@@ -12,13 +12,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import datetime
+import hashlib
+import hmac
 import json
 import os
+import re
 import shutil
 import string
 import sys
 import time
-import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
 from functools import partial
@@ -146,7 +149,6 @@ async def tracked_embedding(
     **kwargs,
 ) -> np.ndarray:
     prompt_tok = sum(count_tokens(t) for t in texts)
-
     if _multimodal:
         result = await _multimodal_embed_batch(
             texts, model=_model_name, base_url=_base_url, api_key=_api_key
@@ -159,7 +161,6 @@ async def tracked_embedding(
             api_key=_api_key,
             **kwargs,
         )
-
     GLOBAL_TRACKER.add_usage({"prompt_tokens": prompt_tok, "completion_tokens": 0})
     return result
 
@@ -181,13 +182,15 @@ async def _multimodal_embed_single(
             async with session.post(url, json=payload, headers=headers) as resp:
                 if resp.status != 200:
                     body = await resp.text()
-                    raise RuntimeError(f"Multimodal embed HTTP {resp.status}: {body[:300]}")
+                    raise RuntimeError(
+                        f"Multimodal embed HTTP {resp.status}: {body[:300]}"
+                    )
                 data = await resp.json()
                 return data["data"]["embedding"]
         except (aiohttp.ClientError, RuntimeError) as exc:
             if attempt == 2:
                 raise
-            logger.warning(f"Multimodal embed retry {attempt+1}: {exc}")
+            logger.warning(f"Multimodal embed retry {attempt + 1}: {exc}")
             await asyncio.sleep(1 * (attempt + 1))
     return []
 
@@ -208,31 +211,164 @@ async def _multimodal_embed_batch(
     }
     async with aiohttp.ClientSession() as session:
         tasks = [
-            _multimodal_embed_single(session, t, model, url, headers)
-            for t in texts
+            _multimodal_embed_single(session, t, model, url, headers) for t in texts
         ]
         embeddings = await asyncio.gather(*tasks)
     return np.array(embeddings, dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
-# F1 / Recall / Accuracy metrics (from LoCoMo evaluation code)
+# VikingDB rerank (Volcengine HMAC-SHA256 auth)
 # ---------------------------------------------------------------------------
-
-try:
-    from nltk.stem import PorterStemmer
-
-    _ps = PorterStemmer()
-except Exception:
-    _ps = None
+def _volcengine_hmac_sha256(key: bytes, content: str) -> bytes:
+    return hmac.new(key, content.encode("utf-8"), hashlib.sha256).digest()
 
 
-def _normalize_answer(s: str) -> str:
+def _volcengine_hash_sha256(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _volcengine_utc_now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _volcengine_sign_headers(
+    ak: str,
+    sk: str,
+    host: str,
+    path: str,
+    body: str,
+    region: str = "cn-beijing",
+    service: str = "vikingdb",
+) -> dict[str, str]:
+    """Build Volcengine HMAC-SHA256 Authorization header."""
+    now = _volcengine_utc_now()
+    x_date = now.strftime("%Y%m%dT%H%M%SZ")
+    short_x_date = x_date[:8]
+    x_content_sha256 = _volcengine_hash_sha256(body)
+
+    signed_headers_str = ";".join(
+        ["content-type", "host", "x-content-sha256", "x-date"]
+    )
+    canonical_request = "\n".join(
+        [
+            "POST",
+            path,
+            "",
+            "content-type:application/json",
+            f"host:{host}",
+            f"x-content-sha256:{x_content_sha256}",
+            f"x-date:{x_date}",
+            "",
+            signed_headers_str,
+            x_content_sha256,
+        ]
+    )
+    hashed_canonical = _volcengine_hash_sha256(canonical_request)
+    credential_scope = f"{short_x_date}/{region}/{service}/request"
+    string_to_sign = f"HMAC-SHA256\n{x_date}\n{credential_scope}\n{hashed_canonical}"
+
+    k_date = _volcengine_hmac_sha256(sk.encode("utf-8"), short_x_date)
+    k_region = _volcengine_hmac_sha256(k_date, region)
+    k_service = _volcengine_hmac_sha256(k_region, service)
+    k_signing = _volcengine_hmac_sha256(k_service, "request")
+    signature = _volcengine_hmac_sha256(k_signing, string_to_sign).hex()
+
+    authorization = (
+        f"HMAC-SHA256 Credential={ak}/{credential_scope}, "
+        f"SignedHeaders={signed_headers_str}, Signature={signature}"
+    )
+    return {
+        "Content-Type": "application/json",
+        "Host": host,
+        "X-Date": x_date,
+        "X-Content-Sha256": x_content_sha256,
+        "Authorization": authorization,
+    }
+
+
+async def vikingdb_rerank(
+    query: str,
+    documents: list[str],
+    top_n: int | None = None,
+    extra_body: dict | None = None,
+    *,
+    ak: str,
+    sk: str,
+    host: str = "api-vikingdb.vikingdb.cn-beijing.volces.com",
+    model_name: str = "doubao-seed-rerank",
+    model_version: str | None = None,
+    threshold: float = 0.0,
+) -> list[dict[str, Any]]:
+    """Call VikingDB rerank API with Volcengine HMAC-SHA256 auth.
+
+    Returns LightRAG-compatible list: [{"index": int, "relevance_score": float}, ...]
+    """
+    path = "/api/vikingdb/rerank"
+    payload: dict[str, Any] = {
+        "model_name": model_name,
+        "query": [{"text": query}],
+        "data": [[{"text": doc}] for doc in documents],
+    }
+    if model_version:
+        payload["model_version"] = model_version
+
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    headers = _volcengine_sign_headers(ak, sk, host, path, body)
+    url = f"https://{host}{path}"
+
+    timeout = aiohttp.ClientTimeout(total=30, connect=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for attempt in range(3):
+            try:
+                async with session.post(url, data=body, headers=headers) as resp:
+                    if resp.status != 200:
+                        err = await resp.text()
+                        raise RuntimeError(
+                            f"VikingDB rerank HTTP {resp.status}: {err[:300]}"
+                        )
+                    resp_json = await resp.json()
+                    break
+            except (aiohttp.ClientError, RuntimeError) as exc:
+                if attempt == 2:
+                    raise
+                logger.warning(f"VikingDB rerank retry {attempt + 1}: {exc}")
+                await asyncio.sleep(1 * (attempt + 1))
+                body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                headers = _volcengine_sign_headers(ak, sk, host, path, body)
+
+    # Response format: {"code": "Success", "result": {"data": [{"id": 0, "score": 0.98}, ...]}}
+    if resp_json.get("code") != "Success":
+        logger.warning(
+            f"VikingDB rerank non-success: {resp_json.get('code')}: {resp_json.get('message', '')}"
+        )
+        return []
+
+    items = resp_json.get("result", {}).get("data", [])
+
+    results = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        idx = item.get("id", item.get("index", 0))
+        score = item.get("score", item.get("relevance_score", 0.0))
+        if score >= threshold:
+            results.append({"index": idx, "relevance_score": score})
+
+    results.sort(key=lambda x: x["relevance_score"], reverse=True)
+    if top_n is not None and len(results) > top_n:
+        results = results[:top_n]
+    return results
+
+
+# ---------------------------------------------------------------------------
+# F1 / Recall / Accuracy metrics
+# ---------------------------------------------------------------------------
+def normalize_answer(s: str) -> str:
+    """标准化答案文本：去标点、转小写、去冠词"""
     s = str(s).replace(",", "")
 
     def remove_articles(text):
-        import re
-
         return re.sub(r"\b(a|an|the|and)\b", " ", text)
 
     def white_space_fix(text):
@@ -245,75 +381,148 @@ def _normalize_answer(s: str) -> str:
     return white_space_fix(remove_articles(remove_punc(s.lower())))
 
 
-def _stem(word: str) -> str:
-    if _ps is not None:
-        return _ps.stem(word)
-    return word.lower()
+def check_refusal(text: str) -> bool:
+    _REFUSAL_KEYWORDS = [
+        "not mentioned",
+        "no information",
+        "cannot be answered",
+        "none",
+        "unknown",
+        "don't know",
+    ]
+    return any(r in text.lower() for r in _REFUSAL_KEYWORDS)
 
 
-def token_f1_score(prediction: str, ground_truth: str) -> float:
-    pred_tokens = [_stem(w) for w in _normalize_answer(prediction).split()]
-    gt_tokens = [_stem(w) for w in _normalize_answer(ground_truth).split()]
-    common = Counter(pred_tokens) & Counter(gt_tokens)
+def calculate_f1(prediction: str, ground_truth: str) -> float:
+    pred_tokens = normalize_answer(prediction).split()
+    truth_tokens = normalize_answer(ground_truth).split()
+    common = Counter(pred_tokens) & Counter(truth_tokens)
     num_same = sum(common.values())
     if num_same == 0:
         return 0.0
-    precision = num_same / len(pred_tokens) if pred_tokens else 0.0
-    recall = num_same / len(gt_tokens) if gt_tokens else 0.0
-    if precision + recall == 0:
-        return 0.0
-    return 2 * precision * recall / (precision + recall)
+    precision = 1.0 * num_same / len(pred_tokens)
+    recall = 1.0 * num_same / len(truth_tokens)
+    return (2 * precision * recall) / (precision + recall)
 
 
 def multi_answer_f1(prediction: str, ground_truth: str) -> float:
-    predictions = [p.strip() for p in prediction.split(",")]
+    """For multiple ground-truth answers (comma-separated), compute F1 for each and take the max."""
+    if check_refusal(prediction) and check_refusal(ground_truth):
+        return 1.0
     ground_truths = [g.strip() for g in ground_truth.split(",")]
-    return float(
-        np.mean(
-            [
-                max(token_f1_score(p, gt) for p in predictions)
-                for gt in ground_truths
-            ]
-        )
-    )
+    return float(max(calculate_f1(prediction, gt) for gt in ground_truths))
 
 
 def compute_f1_for_locomo(prediction: str, answer: str, category: int) -> float:
     answer = str(answer)
     if category == 3:
         answer = answer.split(";")[0].strip()
-
     if category in (2, 3, 4):
-        return token_f1_score(prediction, answer)
+        return calculate_f1(prediction, answer)
     elif category == 1:
         return multi_answer_f1(prediction, answer)
     elif category == 5:
-        if "no information available" in prediction.lower() or "not mentioned" in prediction.lower():
+        if check_refusal(prediction):
             return 1.0
         return 0.0
-    return token_f1_score(prediction, answer)
+    return calculate_f1(prediction, answer)
 
 
 def compute_f1_for_syllabusqa(prediction: str, answer: str) -> float:
-    return token_f1_score(prediction, answer)
+    return calculate_f1(prediction, answer)
 
 
 def compute_recall(prediction: str, answer: str) -> float:
-    pred_tokens = set(_stem(w) for w in _normalize_answer(prediction).split())
-    gt_tokens = set(_stem(w) for w in _normalize_answer(answer).split())
+    if check_refusal(prediction) and check_refusal(answer):
+        return 1.0
+    pred_tokens = set(normalize_answer(prediction).split())
+    gt_tokens = set(normalize_answer(answer).split())
     if not gt_tokens:
         return 1.0
     return len(pred_tokens & gt_tokens) / len(gt_tokens)
 
 
-def compute_accuracy(prediction: str, answer: str) -> float:
-    return 1.0 if _normalize_answer(prediction) == _normalize_answer(str(answer)) else 0.0
+async def llm_grader(
+    _model_name: str,
+    _base_url: str | None,
+    _api_key: str | None,
+    question: str,
+    gold_answer: str,
+    response: str,
+    dataset_name: str = "Locomo",
+) -> bool:
+    # 1. 根据 dataset_name 路由选择 Prompt
+    if "Locomo" in dataset_name.lower():
+        system_prompt = """
+        You are an expert grader that determines if answers to questions match a gold standard answer
+        """
+        ACCURACY_PROMPT = f"""
+    Your task is to label an answer to a question as 'CORRECT' or 'WRONG'. You will be given the following data:
+        (1) a question (posed by one user to another user),
+        (2) a 'gold' (ground truth) answer,
+        (3) a generated answer
+    which you will score as CORRECT/WRONG.
+
+    The point of the question is to ask about something one user should know about the other user based on their prior conversations.
+    The gold answer will usually be a concise and short answer that includes the referenced topic, for example:
+    Question: Do you remember what I got the last time I went to Hawaii?
+    Gold answer: A shell necklace
+    The generated answer might be much longer, but you should be generous with your grading - as long as it touches on the same topic as the gold answer, it should be counted as CORRECT.
+
+    For time related questions, the gold answer will be a specific date, month, year, etc. The generated answer might be much longer or use relative time references (like "last Tuesday" or "next month"), but you should be generous with your grading - as long as it refers to the same date or time period as the gold answer, it should be counted as CORRECT. Even if the format differs (e.g., "May 7th" vs "7 May"), consider it CORRECT if it's the same date.
+
+    Now it's time for the real question:
+    Question: {question}
+    Gold answer: {gold_answer}
+    Generated answer: {response}
+
+    First, provide a short (one sentence) explanation of your reasoning, then finish with CORRECT or WRONG.
+    Do NOT include both CORRECT and WRONG in your response, or it will break the evaluation script.
+
+    Respond with JSON only: {{"is_correct": "CORRECT" or "WRONG", "reasoning": "your explanation"}}
+    """
+    else:
+        # 通用 Prompt 或其他数据集的 Prompt
+        system_prompt = """
+        You are an expert grader that determines if an AI-generated answer matches the gold standard (ground truth) answer for a given question.
+        """
+        ACCURACY_PROMPT = f"""
+        Your task is to label an answer to a question as 'CORRECT' or 'WRONG'. You will be given:
+            (1) A question
+            (2) A 'gold' (ground truth) answer
+            (3) A generated answer
+
+        Grading rules:
+        - If the generated answer correctly encompasses the core semantic meaning or facts of the gold answer, grade it as CORRECT.
+        - If the generated answer contradicts the gold answer or misses the key factual information, it is WRONG.
+
+        Question: {question}
+        Gold answer: {gold_answer}
+        Generated answer: {response}
+
+        First, provide a short (one sentence) explanation of your reasoning, then finish with CORRECT or WRONG.
+        Respond with JSON only: {{"is_correct": "CORRECT" or "WRONG", "reasoning": "your explanation"}}
+        """
+    content = await tracked_llm_complete(
+        prompt=ACCURACY_PROMPT,
+        system_prompt=system_prompt,
+        _model_name=_model_name,
+        _base_url=_base_url,
+        _api_key=_api_key,
+    )
+
+    try:
+        result = json.loads(content)
+        label = result.get("is_correct", result.get("label", "WRONG"))
+        return label.strip().lower() == "correct"
+    except json.JSONDecodeError:
+        # 容错：防止 LLM 没按格式输出 JSON
+        return "CORRECT" in content.upper()
 
 
 # ---------------------------------------------------------------------------
 # Dataset loaders
 # ---------------------------------------------------------------------------
-
 def _filter_docs(
     results: list[dict],
     doc_ids: list[str] | None,
@@ -335,9 +544,7 @@ def _filter_docs(
             except ValueError:
                 pass
         filtered = [
-            r
-            for i, r in enumerate(results)
-            if r["doc_id"] in id_set or i in idx_set
+            r for i, r in enumerate(results) if r["doc_id"] in id_set or i in idx_set
         ]
         if not filtered:
             available = [r["doc_id"] for r in results]
@@ -447,7 +654,6 @@ def load_syllabusqa(
 # ---------------------------------------------------------------------------
 # Benchmark runner
 # ---------------------------------------------------------------------------
-
 @dataclass
 class PhaseMetrics:
     name: str
@@ -525,19 +731,25 @@ async def _run_query_mode(
     docs: list[dict],
     mode: str,
     dataset_name: str,
+    _model_name: str,
+    _base_url: str | None,
+    _api_key: str | None,
     enable_rerank: bool = False,
+    max_concurrent_queries: int = 4,
 ) -> tuple[dict, PhaseMetrics]:
-    """Run all QA queries under a single query mode and return aggregated results + metrics."""
+    """Run all QA queries under a single query mode with concurrency control."""
     GLOBAL_TRACKER.reset()
     t0 = time.perf_counter()
 
-    all_qa: list[QAResult] = []
-    for doc in docs:
-        for qa in doc["qa_pairs"]:
-            question = qa["question"]
-            answer_gt = str(qa["answer"])
-            category = qa.get("category", 1)
+    sem = asyncio.Semaphore(max_concurrent_queries)
+    qa_inputs = [(qa, doc) for doc in docs for qa in doc["qa_pairs"]]
 
+    async def _single_query(qa: dict, doc: dict) -> QAResult:
+        question = qa["question"]
+        answer_gt = str(qa["answer"])
+        category = qa.get("category", 1)
+
+        async with sem:
             try:
                 pred = await rag.aquery(
                     question,
@@ -550,24 +762,32 @@ async def _run_query_mode(
                 logger.error(f"[{mode}] Query failed for '{question[:60]}': {e}")
                 pred = ""
 
-            if dataset_name == "locomo":
-                f1 = compute_f1_for_locomo(pred, answer_gt, category)
-            else:
-                f1 = compute_f1_for_syllabusqa(pred, answer_gt)
-            rec = compute_recall(pred, answer_gt)
-            acc = compute_accuracy(pred, answer_gt)
+        if dataset_name == "locomo":
+            f1 = compute_f1_for_locomo(pred, answer_gt, category)
+        else:
+            f1 = compute_f1_for_syllabusqa(pred, answer_gt)
+        rec = compute_recall(pred, answer_gt)
+        acc = await llm_grader(
+            _model_name=_model_name,
+            _base_url=_base_url,
+            _api_key=_api_key,
+            question=question,
+            gold_answer=answer_gt,
+            response=pred,
+            dataset_name=dataset_name,
+        )
 
-            all_qa.append(
-                QAResult(
-                    question=question,
-                    answer_gt=answer_gt,
-                    answer_pred=pred,
-                    f1=f1,
-                    recall=rec,
-                    accuracy=acc,
-                    category=category,
-                )
-            )
+        return QAResult(
+            question=question,
+            answer_gt=answer_gt,
+            answer_pred=pred,
+            f1=f1,
+            recall=rec,
+            accuracy=acc,
+            category=category,
+        )
+
+    all_qa = await asyncio.gather(*[_single_query(qa, doc) for qa, doc in qa_inputs])
 
     elapsed = time.perf_counter() - t0
     tokens = GLOBAL_TRACKER.snapshot()
@@ -623,23 +843,41 @@ async def run_benchmark_for_dataset(
         _api_key=args.api_key,
     )
 
+    rerank_func = None
+    if args.enable_rerank and args.rerank_ak and args.rerank_sk:
+        rerank_func = partial(
+            vikingdb_rerank,
+            ak=args.rerank_ak,
+            sk=args.rerank_sk,
+            host=args.rerank_host,
+            model_name=args.rerank_model_name,
+            model_version=args.rerank_model_version,
+            threshold=args.rerank_threshold,
+        )
+        logger.info(
+            f"Rerank enabled: {args.rerank_model_name} "
+            f"(version={args.rerank_model_version}) on {args.rerank_host}"
+        )
+
     rag = LightRAG(
         working_dir=str(working_dir),
         llm_model_func=llm_func,
         llm_model_name=args.llm_model,
         embedding_func=embedding_func,
+        rerank_model_func=rerank_func,
         llm_model_max_async=args.max_async,
         embedding_func_max_async=args.max_async,
-        max_parallel_insert=2,
+        max_parallel_insert=args.max_parallel_insert,
     )
     await rag.initialize_storages()
 
-    # --- Phase 1: INSERT (once) ---
+    # --- Phase 1: INSERT (batch) ---
     GLOBAL_TRACKER.reset()
     t0 = time.perf_counter()
 
-    for doc in docs:
-        await rag.ainsert(doc["doc_text"], ids=[doc["doc_id"]])
+    doc_texts = [doc["doc_text"] for doc in docs]
+    doc_ids = [doc["doc_id"] for doc in docs]
+    await rag.ainsert(doc_texts, ids=doc_ids)
 
     insert_time = time.perf_counter() - t0
     insert_tokens = GLOBAL_TRACKER.snapshot()
@@ -651,7 +889,15 @@ async def run_benchmark_for_dataset(
     for mode in query_modes:
         logger.info(f"--- Query mode: {mode} ---")
         agg, metrics = await _run_query_mode(
-            rag, docs, mode, dataset_name, enable_rerank=args.enable_rerank
+            rag,
+            docs,
+            mode,
+            dataset_name,
+            _model_name=args.llm_model,
+            _base_url=args.llm_base_url,
+            _api_key=args.api_key,
+            enable_rerank=args.enable_rerank,
+            max_concurrent_queries=args.max_concurrent_queries,
         )
         query_results[mode] = {
             **agg,
@@ -699,12 +945,13 @@ async def run_benchmark_for_dataset(
 # Main
 # ---------------------------------------------------------------------------
 
+
 def _fmt_tokens(tok: dict) -> str:
     return (
-        f"prompt={tok.get('prompt_tokens',0):,}  "
-        f"comp={tok.get('completion_tokens',0):,}  "
-        f"total={tok.get('total_tokens',0):,}  "
-        f"calls={tok.get('call_count',0)}"
+        f"prompt={tok.get('prompt_tokens', 0):,}  "
+        f"comp={tok.get('completion_tokens', 0):,}  "
+        f"total={tok.get('total_tokens', 0):,}  "
+        f"calls={tok.get('call_count', 0)}"
     )
 
 
@@ -713,21 +960,27 @@ def print_summary(summary: dict):
     ins = summary["insert"]
     dlt = summary["delete"]
 
-    print(f"\n{'='*78}")
-    print(f"  Dataset: {ds}  |  Docs: {summary['num_docs']}  |  QA/mode: {summary['num_qa_per_mode']}")
-    print(f"  Model: {summary['llm_model']}  |  Embedding: {summary['embedding_model']}")
-    print(f"{'='*78}")
+    print(f"\n{'=' * 78}")
+    print(
+        f"  Dataset: {ds}  |  Docs: {summary['num_docs']}  |  QA/mode: {summary['num_qa_per_mode']}"
+    )
+    print(
+        f"  Model: {summary['llm_model']}  |  Embedding: {summary['embedding_model']}"
+    )
+    print(f"{'=' * 78}")
     print(f"  Insert:  {ins['time_sec']:.1f}s  | {_fmt_tokens(ins['tokens'])}")
     print(f"  Delete:  {dlt['time_sec']:.1f}s  | {_fmt_tokens(dlt['tokens'])}")
 
-    print(f"\n  {'Mode':<8} {'F1':>8} {'Recall':>8} {'Acc':>8} {'Time(s)':>9} {'Tokens':>10}")
-    print(f"  {'-'*55}")
+    print(
+        f"\n  {'Mode':<8} {'F1':>8} {'Recall':>8} {'Acc':>8} {'Time(s)':>9} {'Tokens':>10}"
+    )
+    print(f"  {'-' * 55}")
     for mode, res in summary["query_modes"].items():
         qa = res["qa_metrics"]
         print(
             f"  {mode:<8} {qa['f1_mean']:>8.4f} {qa['recall_mean']:>8.4f} "
             f"{qa['accuracy_mean']:>8.4f} {res['time_sec']:>9.1f} "
-            f"{res['tokens'].get('total_tokens',0):>10,}"
+            f"{res['tokens'].get('total_tokens', 0):>10,}"
         )
 
     print(f"\n  Per-mode category breakdown:")
@@ -738,7 +991,7 @@ def print_summary(summary: dict):
                 f"      {cat}: n={m['count']}  F1={m['f1_mean']:.4f}  "
                 f"Recall={m['recall_mean']:.4f}  Acc={m['accuracy_mean']:.4f}"
             )
-    print(f"{'='*78}\n")
+    print(f"{'=' * 78}\n")
 
 
 def parse_args():
@@ -772,13 +1025,34 @@ def parse_args():
         choices=["local", "global", "hybrid", "naive", "mix"],
         help="Query modes to test (default: all five). Example: --query-modes local hybrid mix",
     )
-    p.add_argument("--max-async", type=int, default=4)
+    p.add_argument(
+        "--max-async",
+        type=int,
+        default=8,
+        help="Max concurrent LLM/embedding calls inside LightRAG (default: 8)",
+    )
+    p.add_argument(
+        "--max-parallel-insert",
+        type=int,
+        default=4,
+        help="Max docs processed in parallel during insert (default: 4, max recommended: 10)",
+    )
+    p.add_argument(
+        "--max-concurrent-queries",
+        type=int,
+        default=4,
+        help="Max QA queries run concurrently (default: 4)",
+    )
 
     p.add_argument("--llm-model", required=True, help="LLM model name")
     p.add_argument("--llm-base-url", default=None, help="LLM API base URL")
     p.add_argument("--embedding-model", required=True, help="Embedding model name")
     p.add_argument("--embedding-base-url", default=None, help="Embedding API base URL")
-    p.add_argument("--api-key", default=None, help="API key (shared for LLM + embedding if not set separately)")
+    p.add_argument(
+        "--api-key",
+        default=None,
+        help="API key (shared for LLM + embedding if not set separately)",
+    )
     p.add_argument(
         "--multimodal-embedding",
         action="store_true",
@@ -789,22 +1063,68 @@ def parse_args():
         "--enable-rerank",
         action="store_true",
         default=False,
-        help="Enable reranking during query (requires a rerank model configured in LightRAG). "
-        "Default: disabled to avoid warnings.",
+        help="Enable reranking during query. "
+        "When set, also provide --rerank-ak and --rerank-sk for VikingDB rerank.",
+    )
+    p.add_argument(
+        "--rerank-ak", default=None, help="Volcengine AK for VikingDB rerank"
+    )
+    p.add_argument(
+        "--rerank-sk", default=None, help="Volcengine SK for VikingDB rerank"
+    )
+    p.add_argument(
+        "--rerank-host",
+        default="api-vikingdb.vikingdb.cn-beijing.volces.com",
+        help="VikingDB rerank API host",
+    )
+    p.add_argument(
+        "--rerank-model-name", default="doubao-seed-rerank", help="Rerank model name"
+    )
+    p.add_argument(
+        "--rerank-model-version",
+        default=None,
+        help="Rerank model version (e.g. 251028)",
+    )
+    p.add_argument(
+        "--rerank-threshold",
+        type=float,
+        default=0.1,
+        help="Min rerank score threshold (default: 0.1)",
     )
 
     p.add_argument("--locomo-path", default="/home/wiang/locomo/data/locomo10.json")
-    p.add_argument("--syllabusqa-path", default="/home/wiang/SyllabusQA/data/dataset_split/test.json")
-    p.add_argument("--syllabi-dir", default="/home/wiang/SyllabusQA/syllabi/syllabi_redacted/text")
+    p.add_argument(
+        "--syllabusqa-path",
+        default="/home/wiang/SyllabusQA/data/dataset_split/test.json",
+    )
+    p.add_argument(
+        "--syllabi-dir", default="/home/wiang/SyllabusQA/syllabi/syllabi_redacted/text"
+    )
 
-    p.add_argument("--output-dir", default="./benchmark_output", help="Directory for working data and results")
-    p.add_argument("--output-json", default=None, help="Path to save JSON results (default: <output-dir>/results.json)")
+    p.add_argument(
+        "--output-dir",
+        default="./benchmark_output",
+        help="Directory for working data and results",
+    )
+    p.add_argument(
+        "--output-json",
+        default=None,
+        help="Path to save JSON results (default: <output-dir>/results.json)",
+    )
 
     return p.parse_args()
 
 
 async def async_main(args):
     os.makedirs(args.output_dir, exist_ok=True)
+
+    if args.enable_rerank and not (args.rerank_ak and args.rerank_sk):
+        logger.warning(
+            "--enable-rerank is set but --rerank-ak / --rerank-sk are missing. "
+            "Rerank will be disabled."
+        )
+        args.enable_rerank = False
+
     all_summaries = []
 
     for ds in args.dataset:
