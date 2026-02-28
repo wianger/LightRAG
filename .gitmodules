@@ -10,3 +10,9 @@
 [submodule "datas/natural-questions"]
 	path = datas/natural-questions
 	url = https://github.com/google-research-datasets/natural-questions.git
+[submodule "datas/qasper"]
+	path = datas/qasper
+	url = https://huggingface.co/datasets/allenai/qasper
+[submodule "datas/hotpot_qa"]
+	path = datas/hotpot_qa
+	url = https://huggingface.co/datasets/hotpotqa/hotpot_qa
