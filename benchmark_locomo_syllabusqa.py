@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LightRAG Benchmark: LoCoMo & SyllabusQA
+LightRAG Benchmark: LoCoMo, SyllabusQA & FinanceBench
 
 Measures:
   - F1 score, Recall, Accuracy  (QA quality)
@@ -287,6 +287,57 @@ def _volcengine_sign_headers(
     }
 
 
+_VIKINGDB_BATCH_SIZE = 100
+
+
+async def _vikingdb_rerank_batch(
+    query: str,
+    documents: list[str],
+    offset: int,
+    *,
+    ak: str,
+    sk: str,
+    host: str,
+    model_name: str,
+    model_version: str | None,
+    path: str = "/api/vikingdb/rerank",
+) -> dict:
+    """Send a single rerank request for a batch of ≤100 documents.
+
+    Returns raw response JSON. The caller is responsible for merging results
+    and adjusting indices by *offset*.
+    """
+    payload: dict[str, Any] = {
+        "model_name": model_name,
+        "query": [{"text": query}],
+        "data": [[{"text": doc}] for doc in documents],
+    }
+    if model_version:
+        payload["model_version"] = model_version
+
+    url = f"https://{host}{path}"
+    timeout = aiohttp.ClientTimeout(total=30, connect=10)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for attempt in range(3):
+            body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            headers = _volcengine_sign_headers(ak, sk, host, path, body)
+            try:
+                async with session.post(url, data=body, headers=headers) as resp:
+                    if resp.status != 200:
+                        err = await resp.text()
+                        raise RuntimeError(
+                            f"VikingDB rerank HTTP {resp.status}: {err[:300]}"
+                        )
+                    return await resp.json()
+            except (aiohttp.ClientError, RuntimeError) as exc:
+                if attempt == 2:
+                    raise
+                logger.warning(f"VikingDB rerank retry {attempt + 1}: {exc}")
+                await asyncio.sleep(1 * (attempt + 1))
+    return {}
+
+
 async def vikingdb_rerank(
     query: str,
     documents: list[str],
@@ -302,58 +353,54 @@ async def vikingdb_rerank(
 ) -> list[dict[str, Any]]:
     """Call VikingDB rerank API with Volcengine HMAC-SHA256 auth.
 
+    Automatically splits into batches of ≤100 documents (API limit).
     Returns LightRAG-compatible list: [{"index": int, "relevance_score": float}, ...]
     """
-    path = "/api/vikingdb/rerank"
-    payload: dict[str, Any] = {
-        "model_name": model_name,
-        "query": [{"text": query}],
-        "data": [[{"text": doc}] for doc in documents],
-    }
-    if model_version:
-        payload["model_version"] = model_version
-
-    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    headers = _volcengine_sign_headers(ak, sk, host, path, body)
-    url = f"https://{host}{path}"
-
-    timeout = aiohttp.ClientTimeout(total=30, connect=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        for attempt in range(3):
-            try:
-                async with session.post(url, data=body, headers=headers) as resp:
-                    if resp.status != 200:
-                        err = await resp.text()
-                        raise RuntimeError(
-                            f"VikingDB rerank HTTP {resp.status}: {err[:300]}"
-                        )
-                    resp_json = await resp.json()
-                    break
-            except (aiohttp.ClientError, RuntimeError) as exc:
-                if attempt == 2:
-                    raise
-                logger.warning(f"VikingDB rerank retry {attempt + 1}: {exc}")
-                await asyncio.sleep(1 * (attempt + 1))
-                body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-                headers = _volcengine_sign_headers(ak, sk, host, path, body)
-
-    # Response format: {"code": "Success", "result": {"data": [{"id": 0, "score": 0.98}, ...]}}
-    if resp_json.get("code") != "Success":
-        logger.warning(
-            f"VikingDB rerank non-success: {resp_json.get('code')}: {resp_json.get('message', '')}"
-        )
+    if not documents:
         return []
 
-    items = resp_json.get("result", {}).get("data", [])
+    batches: list[tuple[int, list[str]]] = []
+    for i in range(0, len(documents), _VIKINGDB_BATCH_SIZE):
+        batches.append((i, documents[i : i + _VIKINGDB_BATCH_SIZE]))
 
-    results = []
-    for item in items:
-        if not isinstance(item, dict):
+    if len(batches) > 1:
+        logger.info(
+            f"VikingDB rerank: splitting {len(documents)} docs into {len(batches)} batches"
+        )
+
+    tasks = [
+        _vikingdb_rerank_batch(
+            query,
+            batch_docs,
+            offset,
+            ak=ak,
+            sk=sk,
+            host=host,
+            model_name=model_name,
+            model_version=model_version,
+        )
+        for offset, batch_docs in batches
+    ]
+    batch_responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+    results: list[dict[str, Any]] = []
+    for (offset, _), resp in zip(batches, batch_responses):
+        if isinstance(resp, Exception):
+            logger.warning(f"VikingDB rerank batch (offset={offset}) failed: {resp}")
             continue
-        idx = item.get("id", item.get("index", 0))
-        score = item.get("score", item.get("relevance_score", 0.0))
-        if score >= threshold:
-            results.append({"index": idx, "relevance_score": score})
+        if resp.get("code") != "Success":
+            logger.warning(
+                f"VikingDB rerank batch non-success: "
+                f"{resp.get('code')}: {resp.get('message', '')}"
+            )
+            continue
+        for item in resp.get("result", {}).get("data", []):
+            if not isinstance(item, dict):
+                continue
+            idx = item.get("id", item.get("index", 0)) + offset
+            score = item.get("score", item.get("relevance_score", 0.0))
+            if score >= threshold:
+                results.append({"index": idx, "relevance_score": score})
 
     results.sort(key=lambda x: x["relevance_score"], reverse=True)
     if top_n is not None and len(results) > top_n:
@@ -430,6 +477,12 @@ def compute_f1_for_locomo(prediction: str, answer: str, category: int) -> float:
 
 def compute_f1_for_syllabusqa(prediction: str, answer: str) -> float:
     return calculate_f1(prediction, answer)
+
+
+def compute_f1_for_financebench(prediction: str, answer: str) -> float:
+    """FinanceBench answers are often short numerical/factual strings.
+    Use multi_answer_f1 to handle potential comma-separated alternatives."""
+    return multi_answer_f1(prediction, answer)
 
 
 def compute_recall(prediction: str, answer: str) -> float:
@@ -663,6 +716,202 @@ def load_syllabusqa(
     return _filter_docs(results, doc_ids, max_qa)
 
 
+def _is_docling_available() -> bool:
+    try:
+        import docling  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def _extract_pdf_text(pdf_path: str) -> str:
+    """Extract text from a PDF file using the same priority as LightRAG API:
+    docling (Markdown) → pypdf (plain text) → pdfplumber (plain text).
+    """
+    # 1) docling — highest quality, preserves table structure as Markdown
+    if _is_docling_available():
+        try:
+            from docling.document_converter import DocumentConverter  # type: ignore
+
+            converter = DocumentConverter()
+            result = converter.convert(pdf_path)
+            content = result.document.export_to_markdown()
+            if content.strip():
+                logger.info(f"PDF extracted via docling: {pdf_path}")
+                return content
+        except Exception as exc:
+            logger.warning(f"docling failed for {pdf_path}: {exc}, falling back")
+
+    # 2) pypdf — LightRAG default fallback
+    try:
+        from pypdf import PdfReader  # type: ignore
+
+        reader = PdfReader(pdf_path)
+        if reader.is_encrypted:
+            reader.decrypt("")
+        content = ""
+        for page in reader.pages:
+            content += (page.extract_text() or "") + "\n"
+        if content.strip():
+            logger.info(f"PDF extracted via pypdf: {pdf_path}")
+            return content
+    except ImportError:
+        pass
+    except Exception as exc:
+        logger.warning(f"pypdf failed for {pdf_path}: {exc}, falling back")
+
+    # 3) pdfplumber — additional fallback
+    try:
+        import pdfplumber
+
+        pages_text: list[str] = []
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text:
+                    pages_text.append(text)
+        content = "\n\n".join(pages_text)
+        if content.strip():
+            logger.info(f"PDF extracted via pdfplumber: {pdf_path}")
+            return content
+    except ImportError:
+        pass
+    except Exception as exc:
+        logger.warning(f"pdfplumber failed for {pdf_path}: {exc}")
+
+    raise RuntimeError(
+        f"Cannot extract text from {pdf_path}. "
+        "Install one of: pip install 'docling>=2' / pip install pypdf / pip install pdfplumber"
+    )
+
+
+def load_financebench(
+    data_path: str = "./datas/financebench/data/financebench_open_source.jsonl",
+    pdf_dir: str = "./datas/financebench/pdfs",
+    doc_ids: list[str] | None = None,
+    max_qa: int = 0,
+    use_evidence_only: bool = False,
+) -> list[dict]:
+    """Return list of dicts: {doc_id, doc_text, qa_pairs: [{question, answer, category}]}
+
+    Each doc_id corresponds to a unique doc_name from the dataset (e.g. '3M_2018_10K').
+    QA pairs are grouped by their source document.
+
+    Args:
+        data_path: Path to financebench_open_source.jsonl.
+        pdf_dir: Directory containing PDF files.
+        doc_ids: Filter by doc_name or company name (also supports 0-based index).
+        max_qa: Max QA pairs per document (0 = all).
+        use_evidence_only: If True, use evidence_text_full_page from QA items
+            instead of extracting full PDF text. Much faster but only covers
+            the pages referenced by QA items.
+    """
+    raw = [json.loads(line) for line in Path(data_path).read_text().strip().split("\n")]
+
+    by_doc: dict[str, list[dict]] = {}
+    for item in raw:
+        doc_name = item["doc_name"]
+        by_doc.setdefault(doc_name, []).append(item)
+
+    results = []
+    for doc_name, items in by_doc.items():
+        if use_evidence_only:
+            seen_pages: set[str] = set()
+            page_texts: list[str] = []
+            for item in items:
+                for ev in item.get("evidence", []):
+                    full_page = ev.get("evidence_text_full_page", "")
+                    page_key = f"{ev.get('doc_name', '')}_{ev.get('evidence_page_num', '')}"
+                    if full_page and page_key not in seen_pages:
+                        seen_pages.add(page_key)
+                        page_texts.append(full_page)
+            doc_text = "\n\n".join(page_texts)
+        else:
+            pdf_path = Path(pdf_dir) / f"{doc_name}.pdf"
+            if not pdf_path.exists():
+                logger.warning(f"PDF not found: {pdf_path}, skipping")
+                continue
+            try:
+                doc_text = _extract_pdf_text(str(pdf_path))
+                if not doc_text.strip():
+                    logger.warning(f"Empty text extracted from {pdf_path}, using evidence fallback")
+                    seen_pages_fb: set[str] = set()
+                    page_texts_fb: list[str] = []
+                    for item in items:
+                        for ev in item.get("evidence", []):
+                            full_page = ev.get("evidence_text_full_page", "")
+                            page_key = f"{ev.get('doc_name', '')}_{ev.get('evidence_page_num', '')}"
+                            if full_page and page_key not in seen_pages_fb:
+                                seen_pages_fb.add(page_key)
+                                page_texts_fb.append(full_page)
+                    doc_text = "\n\n".join(page_texts_fb)
+            except Exception as e:
+                logger.warning(f"Failed to extract PDF {pdf_path}: {e}, using evidence fallback")
+                seen_pages_fb2: set[str] = set()
+                page_texts_fb2: list[str] = []
+                for item in items:
+                    for ev in item.get("evidence", []):
+                        full_page = ev.get("evidence_text_full_page", "")
+                        page_key = f"{ev.get('doc_name', '')}_{ev.get('evidence_page_num', '')}"
+                        if full_page and page_key not in seen_pages_fb2:
+                            seen_pages_fb2.add(page_key)
+                            page_texts_fb2.append(full_page)
+                doc_text = "\n\n".join(page_texts_fb2)
+
+        if not doc_text.strip():
+            logger.warning(f"No text for {doc_name}, skipping")
+            continue
+
+        qa_pairs = []
+        for item in items:
+            qa_pairs.append(
+                {
+                    "question": item["question"],
+                    "answer": item["answer"],
+                    "category": item.get("question_type", "unknown"),
+                }
+            )
+
+        results.append(
+            {
+                "doc_id": doc_name,
+                "doc_text": doc_text,
+                "qa_pairs": qa_pairs,
+                "company": items[0].get("company", ""),
+            }
+        )
+
+    if doc_ids:
+        id_set = set(doc_ids)
+        idx_set: set[int] = set()
+        company_set: set[str] = set()
+        for v in doc_ids:
+            try:
+                idx_set.add(int(v))
+            except ValueError:
+                company_set.add(v.upper())
+
+        filtered = []
+        for i, r in enumerate(results):
+            if r["doc_id"] in id_set or i in idx_set:
+                filtered.append(r)
+            elif r.get("company", "").upper() in company_set:
+                filtered.append(r)
+        if not filtered:
+            available = [r["doc_id"] for r in results[:20]]
+            logger.warning(
+                f"No docs matched --doc-ids {doc_ids}. Available (first 20): {available}"
+            )
+        results = filtered
+
+    if max_qa > 0:
+        for r in results:
+            if len(r["qa_pairs"]) > max_qa:
+                r["qa_pairs"] = r["qa_pairs"][:max_qa]
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Benchmark runner
 # ---------------------------------------------------------------------------
@@ -776,6 +1025,8 @@ async def _run_query_mode(
 
         if dataset_name == "locomo":
             f1 = compute_f1_for_locomo(pred, answer_gt, category)
+        elif dataset_name == "financebench":
+            f1 = compute_f1_for_financebench(pred, answer_gt)
         else:
             f1 = compute_f1_for_syllabusqa(pred, answer_gt)
         rec = compute_recall(pred, answer_gt)
@@ -995,7 +1246,7 @@ def print_summary(summary: dict):
             f"{res['tokens'].get('total_tokens', 0):>10,}"
         )
 
-    print(f"\n  Per-mode category breakdown:")
+    print("\n  Per-mode category breakdown:")
     for mode, res in summary["query_modes"].items():
         print(f"    [{mode}]")
         for cat, m in res.get("per_category", {}).items():
@@ -1007,14 +1258,17 @@ def print_summary(summary: dict):
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="LightRAG Benchmark: LoCoMo & SyllabusQA")
+    p = argparse.ArgumentParser(
+        description="LightRAG Benchmark: LoCoMo, SyllabusQA & FinanceBench"
+    )
 
     p.add_argument(
         "--dataset",
         nargs="+",
-        choices=["locomo", "syllabusqa"],
+        choices=["locomo", "syllabusqa", "financebench"],
         default=["locomo", "syllabusqa"],
-        help="Datasets to benchmark (default: both). Example: --dataset locomo syllabusqa",
+        help="Datasets to benchmark (default: locomo + syllabusqa). "
+        "Example: --dataset locomo financebench",
     )
     p.add_argument(
         "--doc-ids",
@@ -1114,6 +1368,24 @@ def parse_args():
     )
 
     p.add_argument(
+        "--financebench-path",
+        default="./datas/financebench/data/financebench_open_source.jsonl",
+        help="Path to financebench_open_source.jsonl",
+    )
+    p.add_argument(
+        "--financebench-pdf-dir",
+        default="./datas/financebench/pdfs",
+        help="Directory containing FinanceBench PDF files",
+    )
+    p.add_argument(
+        "--financebench-use-evidence",
+        action="store_true",
+        default=False,
+        help="Use evidence_text_full_page from QA items instead of extracting "
+        "full PDF text. Much faster but only covers referenced pages.",
+    )
+
+    p.add_argument(
         "--output-dir",
         default="./benchmark_output",
         help="Directory for working data and results",
@@ -1157,6 +1429,20 @@ async def async_main(args):
             )
             total_qa = sum(len(d["qa_pairs"]) for d in docs)
             logger.info(f"SyllabusQA: {len(docs)} docs, {total_qa} QA pairs")
+        elif ds == "financebench":
+            docs = load_financebench(
+                args.financebench_path,
+                args.financebench_pdf_dir,
+                doc_ids=args.doc_ids,
+                max_qa=args.max_qa,
+                use_evidence_only=args.financebench_use_evidence,
+            )
+            total_qa = sum(len(d["qa_pairs"]) for d in docs)
+            total_chars = sum(len(d["doc_text"]) for d in docs)
+            logger.info(
+                f"FinanceBench: {len(docs)} docs, {total_qa} QA pairs, "
+                f"{total_chars:,} chars total"
+            )
         else:
             continue
 
