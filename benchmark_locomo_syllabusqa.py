@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LightRAG Benchmark: LoCoMo, SyllabusQA & FinanceBench
+LightRAG Benchmark: LoCoMo, SyllabusQA, FinanceBench & QASPER
 
 Measures:
   - F1 score, Recall, Accuracy  (QA quality)
@@ -485,6 +485,17 @@ def compute_f1_for_financebench(prediction: str, answer: str) -> float:
     return multi_answer_f1(prediction, answer)
 
 
+def compute_f1_for_qasper(prediction: str, answer: str) -> float:
+    """QASPER answers come from multiple annotators (pipe-separated).
+    Compute F1 against each annotator answer and take the max."""
+    if check_refusal(prediction) and check_refusal(answer):
+        return 1.0
+    annotator_answers = [a.strip() for a in answer.split("|") if a.strip()]
+    if not annotator_answers:
+        return 0.0
+    return float(max(calculate_f1(prediction, a) for a in annotator_answers))
+
+
 def compute_recall(prediction: str, answer: str) -> float:
     if check_refusal(prediction) and check_refusal(answer):
         return 1.0
@@ -912,6 +923,120 @@ def load_financebench(
     return results
 
 
+def _qasper_extract_gold_answer(annotator_entry: dict) -> tuple[str, str]:
+    """Extract a single gold answer string and its type from one annotator entry.
+
+    Returns (answer_text, answer_type).
+    """
+    if annotator_entry.get("unanswerable"):
+        return "Unanswerable", "unanswerable"
+    if annotator_entry.get("yes_no") is not None:
+        return ("Yes" if annotator_entry["yes_no"] else "No"), "yes_no"
+    free = annotator_entry.get("free_form_answer", "")
+    if free and free.strip():
+        return free.strip(), "free_form"
+    spans = annotator_entry.get("extractive_spans", [])
+    if spans:
+        return ", ".join(spans), "extractive"
+    return "", "unknown"
+
+
+def load_qasper(
+    data_dir: str = "./datas/qasper",
+    split: str = "test",
+    doc_ids: list[str] | None = None,
+    max_qa: int = 0,
+) -> list[dict]:
+    """Return list of dicts: {doc_id, doc_text, qa_pairs: [{question, answer, category}]}
+
+    Each doc_id is a paper ID (e.g. arXiv ID like '1911.10742').
+    The document text is reconstructed from title + abstract + full_text sections.
+    Multiple annotator answers are joined with '|' so compute_f1_for_qasper
+    can evaluate against each one independently.
+
+    Args:
+        data_dir: Directory containing train.json / validation.json / test.json.
+        split: Which split to use ('test', 'train', 'validation', or 'all').
+        doc_ids: Filter by paper ID or 0-based index.
+        max_qa: Max QA pairs per paper (0 = all).
+    """
+    if split == "all":
+        splits = ["train", "validation", "test"]
+    else:
+        splits = [split]
+
+    papers: list[dict] = []
+    for s in splits:
+        fpath = Path(data_dir) / f"{s}.json"
+        if not fpath.exists():
+            logger.warning(f"QASPER split not found: {fpath}")
+            continue
+        for line in fpath.read_text().strip().split("\n"):
+            if line.strip():
+                papers.append(json.loads(line))
+
+    results = []
+    for paper in papers:
+        paper_id = paper.get("id", "")
+        title = paper.get("title", "")
+        abstract = paper.get("abstract", "")
+
+        ft = paper.get("full_text", {})
+        sections = ft.get("section_name", [])
+        paragraphs = ft.get("paragraphs", [])
+
+        parts = [title, "", abstract, ""]
+        for sec_name, sec_paras in zip(sections, paragraphs):
+            parts.append(f"## {sec_name}")
+            if isinstance(sec_paras, list):
+                parts.extend(sec_paras)
+            else:
+                parts.append(str(sec_paras))
+            parts.append("")
+        doc_text = "\n\n".join(parts)
+
+        qas = paper.get("qas", {})
+        questions = qas.get("question", [])
+        answers_all = qas.get("answers", [])
+
+        qa_pairs = []
+        for i, question in enumerate(questions):
+            if i >= len(answers_all):
+                break
+            annotator_answers = answers_all[i].get("answer", [])
+
+            gold_texts: list[str] = []
+            answer_type = "unknown"
+            for entry in annotator_answers:
+                text, atype = _qasper_extract_gold_answer(entry)
+                if text:
+                    gold_texts.append(text)
+                    if answer_type == "unknown":
+                        answer_type = atype
+
+            combined_answer = " | ".join(gold_texts) if gold_texts else "Unanswerable"
+            qa_pairs.append(
+                {
+                    "question": question,
+                    "answer": combined_answer,
+                    "category": answer_type,
+                }
+            )
+
+        if not doc_text.strip() or not qa_pairs:
+            continue
+
+        results.append(
+            {
+                "doc_id": paper_id,
+                "doc_text": doc_text,
+                "qa_pairs": qa_pairs,
+            }
+        )
+
+    return _filter_docs(results, doc_ids, max_qa)
+
+
 # ---------------------------------------------------------------------------
 # Benchmark runner
 # ---------------------------------------------------------------------------
@@ -1027,6 +1152,8 @@ async def _run_query_mode(
             f1 = compute_f1_for_locomo(pred, answer_gt, category)
         elif dataset_name == "financebench":
             f1 = compute_f1_for_financebench(pred, answer_gt)
+        elif dataset_name == "qasper":
+            f1 = compute_f1_for_qasper(pred, answer_gt)
         else:
             f1 = compute_f1_for_syllabusqa(pred, answer_gt)
         rec = compute_recall(pred, answer_gt)
@@ -1259,16 +1386,16 @@ def print_summary(summary: dict):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="LightRAG Benchmark: LoCoMo, SyllabusQA & FinanceBench"
+        description="LightRAG Benchmark: LoCoMo, SyllabusQA, FinanceBench & QASPER"
     )
 
     p.add_argument(
         "--dataset",
         nargs="+",
-        choices=["locomo", "syllabusqa", "financebench"],
+        choices=["locomo", "syllabusqa", "financebench", "qasper"],
         default=["locomo", "syllabusqa"],
         help="Datasets to benchmark (default: locomo + syllabusqa). "
-        "Example: --dataset locomo financebench",
+        "Example: --dataset locomo financebench qasper",
     )
     p.add_argument(
         "--doc-ids",
@@ -1386,6 +1513,18 @@ def parse_args():
     )
 
     p.add_argument(
+        "--qasper-path",
+        default="./datas/qasper",
+        help="Directory containing QASPER train.json / validation.json / test.json",
+    )
+    p.add_argument(
+        "--qasper-split",
+        default="test",
+        choices=["train", "validation", "test", "all"],
+        help="QASPER data split to use (default: test)",
+    )
+
+    p.add_argument(
         "--output-dir",
         default="./benchmark_output",
         help="Directory for working data and results",
@@ -1442,6 +1581,18 @@ async def async_main(args):
             logger.info(
                 f"FinanceBench: {len(docs)} docs, {total_qa} QA pairs, "
                 f"{total_chars:,} chars total"
+            )
+        elif ds == "qasper":
+            docs = load_qasper(
+                args.qasper_path,
+                split=args.qasper_split,
+                doc_ids=args.doc_ids,
+                max_qa=args.max_qa,
+            )
+            total_qa = sum(len(d["qa_pairs"]) for d in docs)
+            logger.info(
+                f"QASPER ({args.qasper_split}): {len(docs)} papers, "
+                f"{total_qa} QA pairs"
             )
         else:
             continue
