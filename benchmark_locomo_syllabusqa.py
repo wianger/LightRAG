@@ -508,7 +508,7 @@ async def llm_grader(
         ACCURACY_PROMPT,
         system_prompt=system_prompt,
         base_url=_base_url,
-        api_key=_api_key
+        api_key=_api_key,
     )
 
     try:
@@ -616,10 +616,21 @@ def load_syllabusqa(
     max_qa: int = 0,
 ) -> list[dict]:
     """Return list of dicts: {doc_id, doc_text, qa_pairs: [{question, answer, category}]}"""
-    raw = json.loads(Path(data_path).read_text())
+    test_path = os.path.join(data_path, "test.json")
+    test_raw = json.loads(Path(test_path).read_text())
+    train_path = os.path.join(data_path, "train.json")
+    train_raw = json.loads(Path(train_path).read_text())
+    valid_path = os.path.join(data_path, "val.json")
+    valid_raw = json.loads(Path(valid_path).read_text())
 
     by_syllabus: dict[str, list[dict]] = {}
-    for item in raw:
+    for item in test_raw:
+        name = item["syllabus_name"]
+        by_syllabus.setdefault(name, []).append(item)
+    for item in train_raw:
+        name = item["syllabus_name"]
+        by_syllabus.setdefault(name, []).append(item)
+    for item in valid_raw:
         name = item["syllabus_name"]
         by_syllabus.setdefault(name, []).append(item)
 
@@ -1096,7 +1107,7 @@ def parse_args():
     p.add_argument("--locomo-path", default="./datas/locomo/data/locomo10.json")
     p.add_argument(
         "--syllabusqa-path",
-        default="./datas/SyllabusQA/data/dataset_split/test.json",
+        default="./datas/SyllabusQA/data/dataset_split/",
     )
     p.add_argument(
         "--syllabi-dir", default="./datas/SyllabusQA/syllabi/syllabi_redacted/text"
