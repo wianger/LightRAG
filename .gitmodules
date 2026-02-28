@@ -7,3 +7,6 @@
 [submodule "datas/financebench"]
 	path = datas/financebench
 	url = https://github.com/patronus-ai/financebench.git
+[submodule "datas/hotpot"]
+	path = datas/hotpot
+	url = https://github.com/hotpotqa/hotpot.git
