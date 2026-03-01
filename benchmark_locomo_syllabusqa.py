@@ -943,7 +943,7 @@ def _qasper_extract_gold_answer(annotator_entry: dict) -> tuple[str, str]:
 
 def load_qasper(
     data_dir: str = "./datas/qasper",
-    split: str = "test",
+    split: str = "all",
     doc_ids: list[str] | None = None,
     max_qa: int = 0,
 ) -> list[dict]:
@@ -1519,9 +1519,9 @@ def parse_args():
     )
     p.add_argument(
         "--qasper-split",
-        default="test",
+        default="all",
         choices=["train", "validation", "test", "all"],
-        help="QASPER data split to use (default: test)",
+        help="QASPER data split to use (default: all)",
     )
 
     p.add_argument(
