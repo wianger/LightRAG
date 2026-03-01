@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LightRAG Benchmark: LoCoMo, SyllabusQA, FinanceBench & QASPER
+LightRAG Benchmark: LoCoMo, SyllabusQA, FinanceBench, QASPER & CLAPNQ
 
 Measures:
   - F1 score, Recall, Accuracy  (QA quality)
@@ -492,6 +492,19 @@ def compute_f1_for_qasper(prediction: str, answer: str) -> float:
         return 1.0
     annotator_answers = [a.strip() for a in answer.split("|") if a.strip()]
     if not annotator_answers:
+        return 0.0
+    return float(max(calculate_f1(prediction, a) for a in annotator_answers))
+
+
+def compute_f1_for_clapnq(prediction: str, answer: str) -> float:
+    """CLAPNQ may have multiple annotator answers (pipe-separated).
+    Compute F1 against each and take the max."""
+    if check_refusal(prediction) and check_refusal(answer):
+        return 1.0
+    annotator_answers = [a.strip() for a in answer.split("|") if a.strip()]
+    if not annotator_answers:
+        if check_refusal(prediction):
+            return 1.0
         return 0.0
     return float(max(calculate_f1(prediction, a) for a in annotator_answers))
 
@@ -1037,6 +1050,100 @@ def load_qasper(
     return _filter_docs(results, doc_ids, max_qa)
 
 
+def load_clapnq(
+    data_dir: str = "./datas/clapnq/annotated_data",
+    split: str = "all",
+    include_unanswerable: bool = True,
+    doc_ids: list[str] | None = None,
+    max_qa: int = 0,
+) -> list[dict]:
+    """Return list of dicts: {doc_id, doc_text, qa_pairs: [{question, answer, category}]}
+
+    CLAPNQ items are grouped by passage title to form documents.
+    Each item's passage text is the document content; items sharing
+    the same passage title are merged into one document.
+
+    Multiple annotator answers are joined with '|' so compute_f1_for_clapnq
+    can evaluate against each one independently.
+
+    Args:
+        data_dir: Directory containing dev/ and train/ subdirectories.
+        split: 'dev', 'train', or 'all'.
+        include_unanswerable: Whether to include unanswerable questions.
+        doc_ids: Filter by passage title or 0-based index.
+        max_qa: Max QA pairs per document (0 = all).
+    """
+    if split == "all":
+        splits = ["dev", "train"]
+    else:
+        splits = [split]
+
+    all_items: list[dict] = []
+    for s in splits:
+        ans_path = Path(data_dir) / s / f"clapnq_{s}_answerable.jsonl"
+        if ans_path.exists():
+            for line in ans_path.read_text().strip().split("\n"):
+                if line.strip():
+                    item = json.loads(line)
+                    item["_answerable"] = True
+                    all_items.append(item)
+        else:
+            logger.warning(f"CLAPNQ file not found: {ans_path}")
+
+        if include_unanswerable:
+            unans_path = Path(data_dir) / s / f"clapnq_{s}_unanswerable.jsonl"
+            if unans_path.exists():
+                for line in unans_path.read_text().strip().split("\n"):
+                    if line.strip():
+                        item = json.loads(line)
+                        item["_answerable"] = False
+                        all_items.append(item)
+
+    by_title: dict[str, dict] = {}
+    for item in all_items:
+        if not item.get("passages"):
+            continue
+        passage = item["passages"][0]
+        title = passage.get("title", "unknown")
+
+        if title not in by_title:
+            by_title[title] = {
+                "doc_text": passage.get("text", ""),
+                "qa_pairs": [],
+            }
+
+        outputs = item.get("output", [])
+        if item["_answerable"] and outputs:
+            gold_texts = [o["answer"] for o in outputs if o.get("answer")]
+            combined = " | ".join(gold_texts) if gold_texts else ""
+            category = "answerable"
+        else:
+            combined = "Unanswerable"
+            category = "unanswerable"
+
+        by_title[title]["qa_pairs"].append(
+            {
+                "question": item.get("input", ""),
+                "answer": combined,
+                "category": category,
+            }
+        )
+
+    results = []
+    for title, data in by_title.items():
+        if not data["doc_text"].strip() or not data["qa_pairs"]:
+            continue
+        results.append(
+            {
+                "doc_id": title,
+                "doc_text": data["doc_text"],
+                "qa_pairs": data["qa_pairs"],
+            }
+        )
+
+    return _filter_docs(results, doc_ids, max_qa)
+
+
 # ---------------------------------------------------------------------------
 # Benchmark runner
 # ---------------------------------------------------------------------------
@@ -1154,6 +1261,8 @@ async def _run_query_mode(
             f1 = compute_f1_for_financebench(pred, answer_gt)
         elif dataset_name == "qasper":
             f1 = compute_f1_for_qasper(pred, answer_gt)
+        elif dataset_name == "clapnq":
+            f1 = compute_f1_for_clapnq(pred, answer_gt)
         else:
             f1 = compute_f1_for_syllabusqa(pred, answer_gt)
         rec = compute_recall(pred, answer_gt)
@@ -1386,16 +1495,16 @@ def print_summary(summary: dict):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="LightRAG Benchmark: LoCoMo, SyllabusQA, FinanceBench & QASPER"
+        description="LightRAG Benchmark: LoCoMo, SyllabusQA, FinanceBench, QASPER & CLAPNQ"
     )
 
     p.add_argument(
         "--dataset",
         nargs="+",
-        choices=["locomo", "syllabusqa", "financebench", "qasper"],
+        choices=["locomo", "syllabusqa", "financebench", "qasper", "clapnq"],
         default=["locomo", "syllabusqa"],
         help="Datasets to benchmark (default: locomo + syllabusqa). "
-        "Example: --dataset locomo financebench qasper",
+        "Example: --dataset locomo financebench qasper clapnq",
     )
     p.add_argument(
         "--doc-ids",
@@ -1525,6 +1634,24 @@ def parse_args():
     )
 
     p.add_argument(
+        "--clapnq-path",
+        default="./datas/clapnq/annotated_data",
+        help="Directory containing CLAPNQ annotated data (dev/ and train/ subdirs)",
+    )
+    p.add_argument(
+        "--clapnq-split",
+        default="all",
+        choices=["dev", "train", "all"],
+        help="CLAPNQ data split to use (default: all)",
+    )
+    p.add_argument(
+        "--clapnq-no-unanswerable",
+        action="store_true",
+        default=False,
+        help="Exclude unanswerable questions from CLAPNQ benchmark",
+    )
+
+    p.add_argument(
         "--output-dir",
         default="./benchmark_output",
         help="Directory for working data and results",
@@ -1592,6 +1719,19 @@ async def async_main(args):
             total_qa = sum(len(d["qa_pairs"]) for d in docs)
             logger.info(
                 f"QASPER ({args.qasper_split}): {len(docs)} papers, "
+                f"{total_qa} QA pairs"
+            )
+        elif ds == "clapnq":
+            docs = load_clapnq(
+                args.clapnq_path,
+                split=args.clapnq_split,
+                include_unanswerable=not args.clapnq_no_unanswerable,
+                doc_ids=args.doc_ids,
+                max_qa=args.max_qa,
+            )
+            total_qa = sum(len(d["qa_pairs"]) for d in docs)
+            logger.info(
+                f"CLAPNQ ({args.clapnq_split}): {len(docs)} docs, "
                 f"{total_qa} QA pairs"
             )
         else:
