@@ -436,6 +436,8 @@ def check_refusal(text: str) -> bool:
         "none",
         "unknown",
         "don't know",
+        "unanswerable",
+        "No/insufficient information",
     ]
     return any(r in text.lower() for r in _REFUSAL_KEYWORDS)
 
@@ -509,14 +511,49 @@ def compute_f1_for_clapnq(prediction: str, answer: str) -> float:
     return float(max(calculate_f1(prediction, a) for a in annotator_answers))
 
 
-def compute_recall(prediction: str, answer: str) -> float:
-    if check_refusal(prediction) and check_refusal(answer):
-        return 1.0
-    pred_tokens = set(normalize_answer(prediction).split())
-    gt_tokens = set(normalize_answer(answer).split())
-    if not gt_tokens:
-        return 1.0
-    return len(pred_tokens & gt_tokens) / len(gt_tokens)
+def compute_recall(
+    retrieved_texts: list[str],
+    evidence_list: list[str],
+    soft_threshold: float = 0.8,
+    min_soft_match_tokens: int = 4,
+) -> float:
+    """Compute retrieval recall combining strict substring match and soft token overlap.
+
+    For each evidence item:
+      1. Strict substring match against the concatenated retrieved text.
+      2. If strict fails and the evidence has enough tokens (>= min_soft_match_tokens),
+         check soft token overlap coverage against soft_threshold.
+      3. Short evidence (< min_soft_match_tokens tokens) must pass strict match only.
+
+    Returns hit_count / len(evidence_list).
+    """
+    if not evidence_list:
+        return 0.0
+
+    combined_retrieved = " ".join(retrieved_texts)
+    normalized_retrieved = normalize_answer(combined_retrieved)
+    ret_tokens = set(normalized_retrieved.split())
+
+    hit_count = 0
+    for evidence in evidence_list:
+        if evidence in combined_retrieved:
+            hit_count += 1
+            continue
+
+        normalized_ev = normalize_answer(evidence)
+        ev_tokens = set(normalized_ev.split())
+        if not ev_tokens:
+            continue
+
+        if len(ev_tokens) < min_soft_match_tokens:
+            continue
+
+        overlap_count = len(ev_tokens & ret_tokens)
+        coverage = overlap_count / len(ev_tokens)
+        if coverage >= soft_threshold:
+            hit_count += 1
+
+    return hit_count / len(evidence_list)
 
 
 async def llm_grader(
@@ -527,74 +564,105 @@ async def llm_grader(
     gold_answer: str,
     response: str,
     dataset_name: str = "Locomo",
-) -> float:
-    # 1. 根据 dataset_name 路由选择 Prompt
-    if "Locomo" in dataset_name.lower():
-        system_prompt = """
-        You are an expert grader that determines if answers to questions match a gold standard answer
-        """
-        ACCURACY_PROMPT = f"""
-    Your task is to label an answer to a question as 'CORRECT' or 'WRONG'. You will be given the following data:
-        (1) a question (posed by one user to another user),
-        (2) a 'gold' (ground truth) answer,
-        (3) a generated answer
-    which you will score as CORRECT/WRONG.
+) -> dict:
+    """Use an LLM as a judge to score a generated answer against a gold answer.
 
-    The point of the question is to ask about something one user should know about the other user based on their prior conversations.
-    The gold answer will usually be a concise and short answer that includes the referenced topic, for example:
-    Question: Do you remember what I got the last time I went to Hawaii?
-    Gold answer: A shell necklace
-    The generated answer might be much longer, but you should be generous with your grading - as long as it touches on the same topic as the gold answer, it should be counted as CORRECT.
-
-    For time related questions, the gold answer will be a specific date, month, year, etc. The generated answer might be much longer or use relative time references (like "last Tuesday" or "next month"), but you should be generous with your grading - as long as it refers to the same date or time period as the gold answer, it should be counted as CORRECT. Even if the format differs (e.g., "May 7th" vs "7 May"), consider it CORRECT if it's the same date.
-
-    Now it's time for the real question:
-    Question: {question}
-    Gold answer: {gold_answer}
-    Generated answer: {response}
-
-    First, provide a short (one sentence) explanation of your reasoning, then finish with CORRECT or WRONG.
-    Do NOT include both CORRECT and WRONG in your response, or it will break the evaluation script.
-
-    Respond with JSON only: {{"is_correct": "CORRECT" or "WRONG", "reasoning": "your explanation"}}
+    Returns {"score": int, "reasoning": str, "prompt_type": str}.
+    LoCoMo: score is 0 or 4.  Others: score is 0-4.
     """
+    dataset_lower = (dataset_name or "").lower()
+    content = ""
+    score = 0
+    reasoning = "No reasoning provided."
+
+    if "locomo" in dataset_lower:
+        prompt_type = "Locomo_0or4"
+        system_prompt = (
+            "You are an expert grader that determines if answers to questions "
+            "match a gold standard answer."
+        )
+        accuracy_prompt = f"""Your task is to label an answer to a question by assigning a score of 4 or 0. You will be given the following data:
+(1) a question (posed by one user to another user),
+(2) a 'gold' (ground truth) answer,
+(3) a generated answer
+
+which you will score as 4 or 0.
+The point of the question is to ask about something one user should know about the other user based on their prior conversations.
+The gold answer will usually be a concise and short answer that includes the referenced topic, for example:
+Question: Do you remember what I got the last time I went to Hawaii?
+Gold answer: A shell necklace
+The generated answer might be much longer, but you should be generous with your grading - as long as it touches on the same topic as the gold answer, it should be counted as correct.
+For time related questions, the gold answer will be a specific date, month, year, etc. The generated answer might be much longer or use relative time references (like "last Tuesday" or "next month"), but you should be generous with your grading - as long as it refers to the same date or time period as the gold answer, it should be counted as correct. Even if the format differs (e.g., "May 7th" vs "7 May"), consider it correct if it's the same date.
+
+Scoring rule:
+- Output score 4 if the generated answer should be considered CORRECT.
+- Output score 0 if the generated answer should be considered WRONG.
+
+Now it's time for the real question:
+Question: {question}
+Gold answer: {gold_answer}
+Generated answer: {response}
+
+First, provide a short (one sentence) explanation of your reasoning.
+Respond with JSON only: {{"score": 4 or 0, "reasoning": "your explanation"}}"""
     else:
-        # 通用 Prompt 或其他数据集的 Prompt
-        system_prompt = """
-        You are an expert grader that determines if an AI-generated answer matches the gold standard (ground truth) answer for a given question.
-        """
-        ACCURACY_PROMPT = f"""
-        Your task is to label an answer to a question as 'CORRECT' or 'WRONG'. You will be given:
-            (1) A question
-            (2) A 'gold' (ground truth) answer
-            (3) A generated answer
+        prompt_type = "Generic_0-4"
+        system_prompt = (
+            "You are an expert evaluator scoring how well an AI-generated answer "
+            "matches a gold standard (ground truth)."
+        )
+        accuracy_prompt = f"""Please score the Generated Answer against the Gold Answer on a scale of 0 to 4.
 
-        Grading rules:
-        - If the generated answer correctly encompasses the core semantic meaning or facts of the gold answer, grade it as CORRECT.
-        - If the generated answer contradicts the gold answer or misses the key factual information, it is WRONG.
+[Evaluation Rubric]
+- Score 4 (Perfect): Completely and accurately captures the core meaning and facts of the gold answer.
+- Score 3 (Good): Captures the main facts but includes unnecessary verbosity or minor non-contradictory details.
+- Score 2 (Partial): Missing some key factual information but touches on the correct topic.
+- Score 1 (Poor): Mostly incorrect or severely incomplete.
+- Score 0 (Wrong): Completely wrong, contradicts the gold answer, or hallucinates.
 
-        Question: {question}
-        Gold answer: {gold_answer}
-        Generated answer: {response}
+Question: {question}
+Gold Answer: {gold_answer}
+Generated Answer: {response}
 
-        First, provide a short (one sentence) explanation of your reasoning, then finish with CORRECT or WRONG.
-        Respond with JSON only: {{"is_correct": "CORRECT" or "WRONG", "reasoning": "your explanation"}}
-        """
-    content = await openai_complete_if_cache(
-        _model_name,
-        ACCURACY_PROMPT,
-        system_prompt=system_prompt,
-        base_url=_base_url,
-        api_key=_api_key,
-    )
+First, write a 1-sentence reasoning. Then output the integer score.
+Respond ONLY with a JSON object: {{"score": 0 to 4, "reasoning": "string"}}"""
 
     try:
+        content = await openai_complete_if_cache(
+            _model_name,
+            accuracy_prompt,
+            system_prompt=system_prompt,
+            base_url=_base_url,
+            api_key=_api_key,
+        )
         result = json.loads(content)
-        label = result.get("is_correct", result.get("label", "WRONG"))
-        return 1.0 if label.strip().lower() == "correct" else 0.0
-    except json.JSONDecodeError:
-        # 容错：防止 LLM 没按格式输出 JSON
-        return 1.0 if "CORRECT" in content.upper() else 0.0
+        score = int(result.get("score", 0))
+        reasoning = result.get("reasoning", "No reasoning provided.")
+
+        if "locomo" in dataset_lower:
+            score = 4 if score == 4 else 0
+        else:
+            score = max(0, min(4, score))
+    except Exception:
+        text = (content or "").strip()
+        reasoning = (
+            f"Parse fallback from raw output: {text}"
+            if text
+            else "Parse failed or model invocation failed. Defaulted to 0."
+        )
+        match = re.search(r'"score"\s*:\s*([0-4])', text)
+        if match:
+            score = int(match.group(1))
+        else:
+            match = re.search(r"\b([0-4])\b", text)
+            score = int(match.group(1)) if match else 0
+
+        if "locomo" in dataset_lower:
+            score = 4 if score == 4 else 0
+        else:
+            score = max(0, min(4, score))
+
+    return {"score": score, "reasoning": reasoning, "prompt_type": prompt_type}
 
 
 # ---------------------------------------------------------------------------
@@ -664,8 +732,7 @@ def load_locomo(
         for qa in item["qa"]:
             category = qa.get("category", 1)
             if category == 5:
-                # answer = qa.get("adversarial_answer", qa.get("answer", ""))
-                continue  # Skip category 5 (adversarial) for now since it's not clear how to evaluate it with LLM grading
+                continue
             else:
                 answer = qa.get("answer", "")
             qa_pairs.append(
@@ -673,6 +740,7 @@ def load_locomo(
                     "question": qa["question"],
                     "answer": str(answer),
                     "category": category,
+                    "evidence_list": [str(answer)],
                 }
             )
         results.append(
@@ -726,6 +794,7 @@ def load_syllabusqa(
                     "question": item["question"],
                     "answer": item["answer"],
                     "category": item.get("question_type", "general"),
+                    "evidence_list": [item["answer"]],
                 }
             )
 
@@ -846,7 +915,9 @@ def load_financebench(
             for item in items:
                 for ev in item.get("evidence", []):
                     full_page = ev.get("evidence_text_full_page", "")
-                    page_key = f"{ev.get('doc_name', '')}_{ev.get('evidence_page_num', '')}"
+                    page_key = (
+                        f"{ev.get('doc_name', '')}_{ev.get('evidence_page_num', '')}"
+                    )
                     if full_page and page_key not in seen_pages:
                         seen_pages.add(page_key)
                         page_texts.append(full_page)
@@ -859,7 +930,9 @@ def load_financebench(
             try:
                 doc_text = _extract_pdf_text(str(pdf_path))
                 if not doc_text.strip():
-                    logger.warning(f"Empty text extracted from {pdf_path}, using evidence fallback")
+                    logger.warning(
+                        f"Empty text extracted from {pdf_path}, using evidence fallback"
+                    )
                     seen_pages_fb: set[str] = set()
                     page_texts_fb: list[str] = []
                     for item in items:
@@ -871,7 +944,9 @@ def load_financebench(
                                 page_texts_fb.append(full_page)
                     doc_text = "\n\n".join(page_texts_fb)
             except Exception as e:
-                logger.warning(f"Failed to extract PDF {pdf_path}: {e}, using evidence fallback")
+                logger.warning(
+                    f"Failed to extract PDF {pdf_path}: {e}, using evidence fallback"
+                )
                 seen_pages_fb2: set[str] = set()
                 page_texts_fb2: list[str] = []
                 for item in items:
@@ -889,11 +964,17 @@ def load_financebench(
 
         qa_pairs = []
         for item in items:
+            ev_texts = [
+                ev["evidence_text"]
+                for ev in item.get("evidence", [])
+                if ev.get("evidence_text")
+            ]
             qa_pairs.append(
                 {
                     "question": item["question"],
                     "answer": item["answer"],
                     "category": item.get("question_type", "unknown"),
+                    "evidence_list": ev_texts if ev_texts else [item["answer"]],
                 }
             )
 
@@ -1019,6 +1100,7 @@ def load_qasper(
             annotator_answers = answers_all[i].get("answer", [])
 
             gold_texts: list[str] = []
+            evidence_set: set[str] = set()
             answer_type = "unknown"
             for entry in annotator_answers:
                 text, atype = _qasper_extract_gold_answer(entry)
@@ -1026,13 +1108,18 @@ def load_qasper(
                     gold_texts.append(text)
                     if answer_type == "unknown":
                         answer_type = atype
+                for ev in entry.get("evidence", []):
+                    if ev and isinstance(ev, str) and ev.strip():
+                        evidence_set.add(ev.strip())
 
             combined_answer = " | ".join(gold_texts) if gold_texts else "Unanswerable"
+            ev_list = list(evidence_set) if evidence_set else gold_texts
             qa_pairs.append(
                 {
                     "question": question,
                     "answer": combined_answer,
                     "category": answer_type,
+                    "evidence_list": ev_list if ev_list else ["Unanswerable"],
                 }
             )
 
@@ -1117,15 +1204,24 @@ def load_clapnq(
             gold_texts = [o["answer"] for o in outputs if o.get("answer")]
             combined = " | ".join(gold_texts) if gold_texts else ""
             category = "answerable"
+            ev_list: list[str] = []
+            for o in outputs:
+                for sent in o.get("selected_sentences", []):
+                    if sent and sent.strip() and sent.strip() not in ev_list:
+                        ev_list.append(sent.strip())
+            if not ev_list:
+                ev_list = gold_texts if gold_texts else [""]
         else:
             combined = "Unanswerable"
             category = "unanswerable"
+            ev_list = ["Unanswerable"]
 
         by_title[title]["qa_pairs"].append(
             {
                 "question": item.get("input", ""),
                 "answer": combined,
                 "category": category,
+                "evidence_list": ev_list,
             }
         )
 
@@ -1162,6 +1258,8 @@ class QAResult:
     f1: float = 0.0
     recall: float = 0.0
     accuracy: float = 0.0
+    accuracy_score: int = 0
+    accuracy_reasoning: str = ""
     category: Any = None
 
 
@@ -1182,6 +1280,7 @@ def _aggregate_qa(all_qa: list[QAResult], dataset_name: str) -> dict:
     f1_scores = [q.f1 for q in all_qa]
     recall_scores = [q.recall for q in all_qa]
     acc_scores = [q.accuracy for q in all_qa]
+    raw_scores = [q.accuracy_score for q in all_qa]
 
     categories = sorted(set(str(q.category) for q in all_qa))
     per_category = {}
@@ -1192,6 +1291,7 @@ def _aggregate_qa(all_qa: list[QAResult], dataset_name: str) -> dict:
             "f1_mean": float(np.mean([q.f1 for q in cat_qa])),
             "recall_mean": float(np.mean([q.recall for q in cat_qa])),
             "accuracy_mean": float(np.mean([q.accuracy for q in cat_qa])),
+            "accuracy_score_mean": float(np.mean([q.accuracy_score for q in cat_qa])),
         }
 
     return {
@@ -1202,6 +1302,7 @@ def _aggregate_qa(all_qa: list[QAResult], dataset_name: str) -> dict:
             "recall_std": float(np.std(recall_scores)) if recall_scores else 0.0,
             "accuracy_mean": float(np.mean(acc_scores)) if acc_scores else 0.0,
             "accuracy_std": float(np.std(acc_scores)) if acc_scores else 0.0,
+            "accuracy_score_mean": float(np.mean(raw_scores)) if raw_scores else 0.0,
         },
         "per_category": per_category,
         "qa_details": [
@@ -1212,6 +1313,8 @@ def _aggregate_qa(all_qa: list[QAResult], dataset_name: str) -> dict:
                 "f1": round(q.f1, 4),
                 "recall": round(q.recall, 4),
                 "accuracy": round(q.accuracy, 4),
+                "accuracy_score": q.accuracy_score,
+                "accuracy_reasoning": q.accuracy_reasoning[:300],
                 "category": q.category,
             }
             for q in all_qa
@@ -1241,19 +1344,38 @@ async def _run_query_mode(
         question = qa["question"]
         answer_gt = str(qa["answer"])
         category = qa.get("category", 1)
+        evidence_list = qa.get("evidence_list", [answer_gt])
 
+        retrieved_texts: list[str] = []
         async with sem:
             try:
-                pred = await rag.aquery(
+                result = await rag.aquery_llm(
                     question,
                     param=QueryParam(mode=mode, enable_rerank=enable_rerank),
                 )
-                if pred is None:
-                    pred = ""
+                llm_resp = result.get("llm_response", {})
+                pred = llm_resp.get("content") or ""
                 pred = str(pred).strip()
+
+                data = result.get("data", {})
+                for chunk in data.get("chunks", []):
+                    content = chunk.get("content", "")
+                    if content:
+                        retrieved_texts.append(content)
+                for entity in data.get("entities", []):
+                    desc = entity.get("description", "")
+                    if desc:
+                        retrieved_texts.append(desc)
+                for rel in data.get("relationships", []):
+                    desc = rel.get("description", "")
+                    if desc:
+                        retrieved_texts.append(desc)
             except Exception as e:
                 logger.error(f"[{mode}] Query failed for '{question[:60]}': {e}")
                 pred = ""
+
+        if not retrieved_texts:
+            retrieved_texts = [pred]
 
         if dataset_name == "locomo":
             f1 = compute_f1_for_locomo(pred, answer_gt, category)
@@ -1265,8 +1387,8 @@ async def _run_query_mode(
             f1 = compute_f1_for_clapnq(pred, answer_gt)
         else:
             f1 = compute_f1_for_syllabusqa(pred, answer_gt)
-        rec = compute_recall(pred, answer_gt)
-        acc = await llm_grader(
+        rec = compute_recall(retrieved_texts, evidence_list)
+        grader_result = await llm_grader(
             _model_name=_model_name,
             _base_url=_base_url,
             _api_key=_api_key,
@@ -1275,6 +1397,8 @@ async def _run_query_mode(
             response=pred,
             dataset_name=dataset_name,
         )
+        raw_score = grader_result["score"]
+        acc = raw_score / 4.0
 
         return QAResult(
             question=question,
@@ -1283,6 +1407,8 @@ async def _run_query_mode(
             f1=f1,
             recall=rec,
             accuracy=acc,
+            accuracy_score=raw_score,
+            accuracy_reasoning=grader_result["reasoning"],
             category=category,
         )
 
@@ -1471,14 +1597,15 @@ def print_summary(summary: dict):
     print(f"  Delete:  {dlt['time_sec']:.1f}s  | {_fmt_tokens(dlt['tokens'])}")
 
     print(
-        f"\n  {'Mode':<8} {'F1':>8} {'Recall':>8} {'Acc':>8} {'Time(s)':>9} {'Tokens':>10}"
+        f"\n  {'Mode':<8} {'F1':>8} {'Recall':>8} {'Acc':>8} {'Score':>8} {'Time(s)':>9} {'Tokens':>10}"
     )
-    print(f"  {'-' * 55}")
+    print(f"  {'-' * 65}")
     for mode, res in summary["query_modes"].items():
         qa = res["qa_metrics"]
+        score_mean = qa.get("accuracy_score_mean", qa["accuracy_mean"] * 4)
         print(
             f"  {mode:<8} {qa['f1_mean']:>8.4f} {qa['recall_mean']:>8.4f} "
-            f"{qa['accuracy_mean']:>8.4f} {res['time_sec']:>9.1f} "
+            f"{qa['accuracy_mean']:>8.4f} {score_mean:>8.2f} {res['time_sec']:>9.1f} "
             f"{res['tokens'].get('total_tokens', 0):>10,}"
         )
 
@@ -1486,9 +1613,11 @@ def print_summary(summary: dict):
     for mode, res in summary["query_modes"].items():
         print(f"    [{mode}]")
         for cat, m in res.get("per_category", {}).items():
+            score_m = m.get("accuracy_score_mean", m["accuracy_mean"] * 4)
             print(
                 f"      {cat}: n={m['count']}  F1={m['f1_mean']:.4f}  "
-                f"Recall={m['recall_mean']:.4f}  Acc={m['accuracy_mean']:.4f}"
+                f"Recall={m['recall_mean']:.4f}  Acc={m['accuracy_mean']:.4f}  "
+                f"Score={score_m:.2f}/4"
             )
     print(f"{'=' * 78}\n")
 
@@ -1718,8 +1847,7 @@ async def async_main(args):
             )
             total_qa = sum(len(d["qa_pairs"]) for d in docs)
             logger.info(
-                f"QASPER ({args.qasper_split}): {len(docs)} papers, "
-                f"{total_qa} QA pairs"
+                f"QASPER ({args.qasper_split}): {len(docs)} papers, {total_qa} QA pairs"
             )
         elif ds == "clapnq":
             docs = load_clapnq(
@@ -1731,8 +1859,7 @@ async def async_main(args):
             )
             total_qa = sum(len(d["qa_pairs"]) for d in docs)
             logger.info(
-                f"CLAPNQ ({args.clapnq_split}): {len(docs)} docs, "
-                f"{total_qa} QA pairs"
+                f"CLAPNQ ({args.clapnq_split}): {len(docs)} docs, {total_qa} QA pairs"
             )
         else:
             continue
