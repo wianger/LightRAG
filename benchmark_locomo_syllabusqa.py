@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LightRAG Benchmark: LoCoMo, SyllabusQA, FinanceBench, QASPER & CLAPNQ
+LightRAG Benchmark: LoCoMo, SyllabusQA, FinanceBench, QASPER, CLAPNQ & HotpotQA
 
 Measures:
   - F1 score, Recall, Accuracy  (QA quality)
@@ -509,6 +509,11 @@ def compute_f1_for_clapnq(prediction: str, answer: str) -> float:
             return 1.0
         return 0.0
     return float(max(calculate_f1(prediction, a) for a in annotator_answers))
+
+
+def compute_f1_for_hotpotqa(prediction: str, answer: str) -> float:
+    """HotpotQA answers are short factual strings."""
+    return calculate_f1(prediction, answer)
 
 
 def compute_recall(
@@ -1240,6 +1245,113 @@ def load_clapnq(
     return _filter_docs(results, doc_ids, max_qa)
 
 
+def load_hotpotqa(
+    data_dir: str = "./datas/HotpotQA_small",
+    doc_ids: list[str] | None = None,
+    max_qa: int = 0,
+) -> list[dict]:
+    """Return list of dicts: {doc_id, doc_text, qa_pairs: [{question, answer, category, evidence_list}]}
+
+    HotpotQA is a multi-hop QA dataset where each question requires reasoning
+    over multiple Wikipedia articles.  The ``hotpot_articles.json`` file
+    provides full article texts; ``hotpot_qa_100.json`` contains 100 QA pairs
+    with context paragraphs and supporting-fact annotations.
+
+    Documents are sourced from ``hotpot_articles.json``.  Each article becomes
+    one ``doc_id`` (its title).  QA pairs reference articles via
+    ``supporting_facts.title`` and are attached to **all** supporting
+    documents so the benchmark inserts full articles and then queries across
+    them.
+
+    Args:
+        data_dir: Directory containing hotpot_qa_100.json and hotpot_articles.json.
+        doc_ids: Filter by article title or 0-based index.
+        max_qa: Max QA pairs per document (0 = all).
+    """
+    articles_path = Path(data_dir) / "hotpot_articles.json"
+    qa_path = Path(data_dir) / "hotpot_qa_100.json"
+
+    if not articles_path.exists():
+        raise FileNotFoundError(f"HotpotQA articles not found: {articles_path}")
+    if not qa_path.exists():
+        raise FileNotFoundError(f"HotpotQA QA file not found: {qa_path}")
+
+    articles_raw = json.loads(articles_path.read_text())
+    qa_raw = json.loads(qa_path.read_text())
+
+    article_texts: dict[str, str] = {}
+    for art in articles_raw:
+        title = art.get("title", "")
+        if not title:
+            continue
+        paragraphs = art.get("text", [])
+        full_text = "\n".join(
+            " ".join(sent for sent in para if isinstance(sent, str))
+            for para in paragraphs
+            if isinstance(para, list)
+        ).strip()
+        if full_text:
+            article_texts[title] = full_text
+
+    doc_qa_map: dict[str, list[dict]] = {}
+
+    for qa in qa_raw:
+        question = qa.get("question", "")
+        answer = qa.get("answer", "")
+        q_type = qa.get("type", "unknown")
+
+        sf_titles = qa.get("supporting_facts", {}).get("title", [])
+        sf_sent_ids = qa.get("supporting_facts", {}).get("sent_id", [])
+
+        ctx_titles = qa.get("context", {}).get("title", [])
+        ctx_sentences = qa.get("context", {}).get("sentences", [])
+
+        evidence_list: list[str] = []
+        for sf_title, sf_sid in zip(sf_titles, sf_sent_ids):
+            for ci, ct in enumerate(ctx_titles):
+                if ct == sf_title:
+                    sents = ctx_sentences[ci] if ci < len(ctx_sentences) else []
+                    if isinstance(sf_sid, int) and sf_sid < len(sents):
+                        ev = sents[sf_sid].strip()
+                        if ev and ev not in evidence_list:
+                            evidence_list.append(ev)
+                    break
+
+        if not evidence_list:
+            evidence_list = [answer]
+
+        unique_sf_titles = list(dict.fromkeys(sf_titles))
+        for sf_title in unique_sf_titles:
+            if sf_title not in article_texts:
+                continue
+            doc_qa_map.setdefault(sf_title, []).append(
+                {
+                    "question": question,
+                    "answer": answer,
+                    "category": q_type,
+                    "evidence_list": evidence_list,
+                }
+            )
+
+    results = []
+    for title, qa_pairs in doc_qa_map.items():
+        results.append(
+            {
+                "doc_id": title,
+                "doc_text": article_texts[title],
+                "qa_pairs": qa_pairs,
+            }
+        )
+
+    logger.info(
+        f"HotpotQA: {len(article_texts)} articles loaded, "
+        f"{len(doc_qa_map)} have QA pairs, "
+        f"{sum(len(v) for v in doc_qa_map.values())} total QA entries"
+    )
+
+    return _filter_docs(results, doc_ids, max_qa)
+
+
 # ---------------------------------------------------------------------------
 # Benchmark runner
 # ---------------------------------------------------------------------------
@@ -1385,6 +1497,8 @@ async def _run_query_mode(
             f1 = compute_f1_for_qasper(pred, answer_gt)
         elif dataset_name == "clapnq":
             f1 = compute_f1_for_clapnq(pred, answer_gt)
+        elif dataset_name == "hotpotqa":
+            f1 = compute_f1_for_hotpotqa(pred, answer_gt)
         else:
             f1 = compute_f1_for_syllabusqa(pred, answer_gt)
         rec = compute_recall(retrieved_texts, evidence_list)
@@ -1624,16 +1738,16 @@ def print_summary(summary: dict):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="LightRAG Benchmark: LoCoMo, SyllabusQA, FinanceBench, QASPER & CLAPNQ"
+        description="LightRAG Benchmark: LoCoMo, SyllabusQA, FinanceBench, QASPER, CLAPNQ & HotpotQA"
     )
 
     p.add_argument(
         "--dataset",
         nargs="+",
-        choices=["locomo", "syllabusqa", "financebench", "qasper", "clapnq"],
-        default=["locomo", "syllabusqa"],
-        help="Datasets to benchmark (default: locomo + syllabusqa). "
-        "Example: --dataset locomo financebench qasper clapnq",
+        choices=["locomo", "syllabusqa", "financebench", "qasper", "clapnq", "hotpotqa"],
+        default=None,
+        help="Datasets to benchmark. "
+        "Example: --dataset locomo financebench qasper clapnq hotpotqa",
     )
     p.add_argument(
         "--doc-ids",
@@ -1781,6 +1895,12 @@ def parse_args():
     )
 
     p.add_argument(
+        "--hotpotqa-path",
+        default="./datas/HotpotQA_small",
+        help="Directory containing hotpot_qa_100.json and hotpot_articles.json",
+    )
+
+    p.add_argument(
         "--output-dir",
         default="./benchmark_output",
         help="Directory for working data and results",
@@ -1860,6 +1980,16 @@ async def async_main(args):
             total_qa = sum(len(d["qa_pairs"]) for d in docs)
             logger.info(
                 f"CLAPNQ ({args.clapnq_split}): {len(docs)} docs, {total_qa} QA pairs"
+            )
+        elif ds == "hotpotqa":
+            docs = load_hotpotqa(
+                args.hotpotqa_path,
+                doc_ids=args.doc_ids,
+                max_qa=args.max_qa,
+            )
+            total_qa = sum(len(d["qa_pairs"]) for d in docs)
+            logger.info(
+                f"HotpotQA: {len(docs)} docs, {total_qa} QA pairs"
             )
         else:
             continue
