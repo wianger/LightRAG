@@ -1744,7 +1744,14 @@ def parse_args():
     p.add_argument(
         "--dataset",
         nargs="+",
-        choices=["locomo", "syllabusqa", "financebench", "qasper", "clapnq", "hotpotqa"],
+        choices=[
+            "locomo",
+            "syllabusqa",
+            "financebench",
+            "qasper",
+            "clapnq",
+            "hotpotqa",
+        ],
         default=None,
         help="Datasets to benchmark. "
         "Example: --dataset locomo financebench qasper clapnq hotpotqa",
@@ -1988,9 +1995,7 @@ async def async_main(args):
                 max_qa=args.max_qa,
             )
             total_qa = sum(len(d["qa_pairs"]) for d in docs)
-            logger.info(
-                f"HotpotQA: {len(docs)} docs, {total_qa} QA pairs"
-            )
+            logger.info(f"HotpotQA: {len(docs)} docs, {total_qa} QA pairs")
         else:
             continue
 
