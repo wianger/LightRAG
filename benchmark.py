@@ -22,7 +22,7 @@ import shutil
 import string
 import sys
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -78,6 +78,13 @@ class TiktokenTracker:
 
     def snapshot(self) -> dict:
         return self.get_usage()
+
+    def merge_snapshot(self, snap: dict):
+        """Accumulate token counts from another snapshot into this tracker."""
+        self.prompt_tokens += snap.get("prompt_tokens", 0)
+        self.completion_tokens += snap.get("completion_tokens", 0)
+        self.total_tokens += snap.get("total_tokens", 0)
+        self.call_count += snap.get("call_count", 0)
 
     def __str__(self):
         u = self.get_usage()
@@ -710,6 +717,43 @@ def _filter_docs(
     return results
 
 
+def _resolve_locomo_evidence(conv: dict, evidence_refs: list[str]) -> list[str]:
+    """Resolve LoCoMo evidence references (e.g. 'D1:3') to original turn texts.
+
+    Each turn in the conversation carries a ``dia_id`` like ``D1:3``.  We build
+    a lookup from dia_id to the turn dict, then for each reference we emit the
+    speaker-prefixed text (matching doc_text format) so that recall can do a
+    meaningful substring / soft-token match.
+    """
+    dia_id_map: dict[str, dict] = {}
+    for i in range(1, 100):
+        key = f"session_{i}"
+        if key not in conv:
+            break
+        for turn in conv[key]:
+            did = turn.get("dia_id", "")
+            if did:
+                dia_id_map[did] = turn
+
+    evidence_texts: list[str] = []
+    for ref_str in evidence_refs:
+        refs = re.split(r"[;\s]+", ref_str.strip())
+        for ref in refs:
+            ref = ref.strip()
+            m = re.match(r"D(\d+):(\d+)$", ref)
+            if not m:
+                continue
+            turn = dia_id_map.get(ref)
+            if not turn:
+                continue
+            text = f"{turn['speaker']}: {turn['text']}"
+            blip = turn.get("blip_caption", "")
+            if blip:
+                text += f" [{blip}]"
+            evidence_texts.append(text)
+    return evidence_texts
+
+
 def load_locomo(
     data_path: str = "./datas/locomo/data/locomo10.json",
     doc_ids: list[str] | None = None,
@@ -738,14 +782,21 @@ def load_locomo(
             category = qa.get("category", 1)
             if category == 5:
                 continue
-            else:
-                answer = qa.get("answer", "")
+            answer = qa.get("answer")
+            if answer is None or not str(answer).strip():
+                continue
+            answer = str(answer)
+            evidence_list = _resolve_locomo_evidence(
+                conv, qa.get("evidence", [])
+            )
+            if not evidence_list:
+                evidence_list = [answer]
             qa_pairs.append(
                 {
                     "question": qa["question"],
-                    "answer": str(answer),
+                    "answer": answer,
                     "category": category,
-                    "evidence_list": [str(answer)],
+                    "evidence_list": evidence_list,
                 }
             )
         results.append(
@@ -794,12 +845,28 @@ def load_syllabusqa(
 
         qa_pairs = []
         for item in qa_items:
+            answer = str(item.get("answer", "")).strip()
+            if not answer or answer.lower() == "no/insufficient information":
+                continue
+            spans = [
+                item[f"answer_span_{i}"]
+                for i in range(1, 6)
+                if item.get(f"answer_span_{i}") is not None
+            ]
+            steps = [
+                item[f"reasoning_step_{i}"]
+                for i in range(1, 6)
+                if item.get(f"reasoning_step_{i}") is not None
+            ]
+            evidence_list = spans + steps
+            if not evidence_list:
+                evidence_list = [str(answer)]
             qa_pairs.append(
                 {
                     "question": item["question"],
-                    "answer": item["answer"],
+                    "answer": str(answer),
                     "category": item.get("question_type", "general"),
-                    "evidence_list": [item["answer"]],
+                    "evidence_list": evidence_list,
                 }
             )
 
@@ -1109,6 +1176,8 @@ def load_qasper(
             answer_type = "unknown"
             for entry in annotator_answers:
                 text, atype = _qasper_extract_gold_answer(entry)
+                if atype == "unanswerable":
+                    continue
                 if text:
                     gold_texts.append(text)
                     if answer_type == "unknown":
@@ -1117,14 +1186,16 @@ def load_qasper(
                     if ev and isinstance(ev, str) and ev.strip():
                         evidence_set.add(ev.strip())
 
-            combined_answer = " | ".join(gold_texts) if gold_texts else "Unanswerable"
+            if not gold_texts:
+                continue
+            combined_answer = " | ".join(gold_texts)
             ev_list = list(evidence_set) if evidence_set else gold_texts
             qa_pairs.append(
                 {
                     "question": question,
                     "answer": combined_answer,
                     "category": answer_type,
-                    "evidence_list": ev_list if ev_list else ["Unanswerable"],
+                    "evidence_list": ev_list if ev_list else [combined_answer],
                 }
             )
 
@@ -1145,7 +1216,7 @@ def load_qasper(
 def load_clapnq(
     data_dir: str = "./datas/clapnq/annotated_data",
     split: str = "all",
-    include_unanswerable: bool = True,
+    include_unanswerable: bool = False,
     doc_ids: list[str] | None = None,
     max_qa: int = 0,
 ) -> list[dict]:
@@ -1444,8 +1515,11 @@ async def _run_query_mode(
     _api_key: str | None,
     enable_rerank: bool = False,
     max_concurrent_queries: int = 4,
-) -> tuple[dict, PhaseMetrics]:
-    """Run all QA queries under a single query mode with concurrency control."""
+) -> tuple[list[QAResult], dict, PhaseMetrics]:
+    """Run all QA queries under a single query mode with concurrency control.
+
+    Returns (raw_qa_list, aggregated_dict, phase_metrics).
+    """
     GLOBAL_TRACKER.reset()
     t0 = time.perf_counter()
 
@@ -1533,8 +1607,9 @@ async def _run_query_mode(
     metrics = PhaseMetrics(f"query_{mode}", elapsed, tokens)
     logger.info(f"QUERY [{mode}] done: {elapsed:.2f}s  tokens={GLOBAL_TRACKER}")
 
-    agg = _aggregate_qa(all_qa, dataset_name)
-    return agg, metrics
+    qa_list = list(all_qa)
+    agg = _aggregate_qa(qa_list, dataset_name)
+    return qa_list, agg, metrics
 
 
 ALL_QUERY_MODES = ["local", "global", "hybrid", "naive", "mix"]
@@ -1627,7 +1702,7 @@ async def run_benchmark_for_dataset(
     query_results: dict[str, dict] = {}
     for mode in query_modes:
         logger.info(f"--- Query mode: {mode} ---")
-        agg, metrics = await _run_query_mode(
+        _, agg, metrics = await _run_query_mode(
             rag,
             docs,
             mode,
@@ -1680,6 +1755,206 @@ async def run_benchmark_for_dataset(
     return summary
 
 
+async def run_benchmark_per_question(
+    dataset_name: str,
+    docs: list[dict],
+    args: argparse.Namespace,
+) -> dict:
+    """Per-question benchmark: group QAs by their required doc set,
+    then for each group: insert docs -> query all modes -> delete docs.
+
+    QAs sharing identical document sets are batched together to avoid
+    redundant insertion/deletion.
+    """
+    query_modes = args.query_modes
+    doc_by_id = {d["doc_id"]: d for d in docs}
+
+    # --- Deduplicate QAs and map each to its required doc set ---
+    qa_key_to_doc_ids: dict[str, set[str]] = {}
+    qa_key_to_data: dict[str, dict] = {}
+    for doc in docs:
+        for qa in doc["qa_pairs"]:
+            key = qa["question"]
+            qa_key_to_doc_ids.setdefault(key, set()).add(doc["doc_id"])
+            if key not in qa_key_to_data:
+                qa_key_to_data[key] = qa
+
+    doc_set_groups: dict[frozenset, list[dict]] = defaultdict(list)
+    for q_key, did_set in qa_key_to_doc_ids.items():
+        doc_set_groups[frozenset(did_set)].append(qa_key_to_data[q_key])
+
+    num_groups = len(doc_set_groups)
+    total_unique_qa = sum(len(qs) for qs in doc_set_groups.values())
+    logger.info(
+        f"=== Per-question {dataset_name}: {num_groups} doc-groups, "
+        f"{total_unique_qa} unique QAs, {len(doc_by_id)} unique docs, "
+        f"modes={query_modes} ==="
+    )
+
+    # --- Shared infrastructure ---
+    embed_func_partial = partial(
+        tracked_embedding,
+        _model_name=args.embedding_model,
+        _base_url=args.embedding_base_url,
+        _api_key=args.api_key,
+        _multimodal=args.multimodal_embedding,
+    )
+    embedding_dim = await detect_embedding_dim(embed_func_partial, GLOBAL_TRACKER)
+    logger.info(f"Detected embedding dim: {embedding_dim}")
+
+    embedding_func = EmbeddingFunc(
+        embedding_dim=embedding_dim,
+        max_token_size=8192,
+        func=embed_func_partial,
+    )
+    llm_func = partial(
+        tracked_llm_complete,
+        _model_name=args.llm_model,
+        _base_url=args.llm_base_url,
+        _api_key=args.api_key,
+    )
+    rerank_func = None
+    if args.enable_rerank and args.rerank_ak and args.rerank_sk:
+        rerank_func = partial(
+            vikingdb_rerank,
+            ak=args.rerank_ak,
+            sk=args.rerank_sk,
+            host=args.rerank_host,
+            model_name=args.rerank_model_name,
+            model_version=args.rerank_model_version,
+            threshold=args.rerank_threshold,
+        )
+
+    base_working_dir = Path(args.output_dir) / f"rag_{dataset_name}_pq"
+
+    # --- Accumulators ---
+    total_insert_time = 0.0
+    insert_acc = TiktokenTracker()
+    total_delete_time = 0.0
+    delete_acc = TiktokenTracker()
+    mode_qa_results: dict[str, list[QAResult]] = {m: [] for m in query_modes}
+    mode_query_time: dict[str, float] = {m: 0.0 for m in query_modes}
+    mode_query_acc: dict[str, TiktokenTracker] = {
+        m: TiktokenTracker() for m in query_modes
+    }
+
+    sorted_groups = sorted(
+        doc_set_groups.items(), key=lambda x: len(x[1]), reverse=True
+    )
+
+    for group_idx, (doc_id_set, qa_list) in enumerate(sorted_groups):
+        sorted_dids = sorted(doc_id_set)
+        logger.info(
+            f"  Group {group_idx + 1}/{num_groups}: "
+            f"{len(sorted_dids)} doc(s) [{', '.join(sorted_dids[:3])}"
+            f"{'...' if len(sorted_dids) > 3 else ''}], {len(qa_list)} QA(s)"
+        )
+
+        # Build group docs; attach QA pairs to the first doc only
+        group_docs = []
+        for i, did in enumerate(sorted_dids):
+            group_docs.append(
+                {
+                    "doc_id": did,
+                    "doc_text": doc_by_id[did]["doc_text"],
+                    "qa_pairs": qa_list if i == 0 else [],
+                }
+            )
+
+        # Fresh working directory per group
+        working_dir = base_working_dir / f"g{group_idx}"
+        if working_dir.exists():
+            shutil.rmtree(working_dir)
+        working_dir.mkdir(parents=True, exist_ok=True)
+
+        rag = LightRAG(
+            working_dir=str(working_dir),
+            llm_model_func=llm_func,
+            llm_model_name=args.llm_model,
+            embedding_func=embedding_func,
+            rerank_model_func=rerank_func,
+            llm_model_max_async=args.max_async,
+            embedding_func_max_async=args.max_async,
+            max_parallel_insert=args.max_parallel_insert,
+        )
+        await rag.initialize_storages()
+
+        # INSERT
+        GLOBAL_TRACKER.reset()
+        t0 = time.perf_counter()
+        await rag.ainsert(
+            [d["doc_text"] for d in group_docs],
+            ids=[d["doc_id"] for d in group_docs],
+        )
+        total_insert_time += time.perf_counter() - t0
+        insert_acc.merge_snapshot(GLOBAL_TRACKER.snapshot())
+
+        # QUERY (each mode)
+        for mode in query_modes:
+            raw_qa, _agg, metrics = await _run_query_mode(
+                rag,
+                group_docs,
+                mode,
+                dataset_name,
+                _model_name=args.llm_model,
+                _base_url=args.llm_base_url,
+                _api_key=args.api_key,
+                enable_rerank=args.enable_rerank,
+                max_concurrent_queries=args.max_concurrent_queries,
+            )
+            mode_qa_results[mode].extend(raw_qa)
+            mode_query_time[mode] += metrics.elapsed_sec
+            mode_query_acc[mode].merge_snapshot(metrics.token_usage)
+
+        # DELETE
+        GLOBAL_TRACKER.reset()
+        t0 = time.perf_counter()
+        for d in group_docs:
+            try:
+                await rag.adelete_by_doc_id(d["doc_id"])
+            except Exception as e:
+                logger.error(f"Delete failed for doc {d['doc_id']}: {e}")
+        total_delete_time += time.perf_counter() - t0
+        delete_acc.merge_snapshot(GLOBAL_TRACKER.snapshot())
+
+        await rag.finalize_storages()
+        shutil.rmtree(working_dir, ignore_errors=True)
+
+    # Clean up base dir
+    if base_working_dir.exists():
+        shutil.rmtree(base_working_dir, ignore_errors=True)
+
+    # --- Aggregate ---
+    query_results: dict[str, dict] = {}
+    for mode in query_modes:
+        agg = _aggregate_qa(mode_qa_results[mode], dataset_name)
+        query_results[mode] = {
+            **agg,
+            "time_sec": round(mode_query_time[mode], 3),
+            "tokens": mode_query_acc[mode].snapshot(),
+        }
+
+    summary = {
+        "dataset": dataset_name,
+        "benchmark_mode": "per_question",
+        "num_groups": num_groups,
+        "num_docs": len(doc_by_id),
+        "num_qa_per_mode": total_unique_qa,
+        "llm_model": args.llm_model,
+        "embedding_model": args.embedding_model,
+        "insert": {
+            "time_sec": round(total_insert_time, 3),
+            "tokens": insert_acc.snapshot(),
+        },
+        "query_modes": query_results,
+        "delete": {
+            "time_sec": round(total_delete_time, 3),
+            "tokens": delete_acc.snapshot(),
+        },
+    }
+    return summary
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1698,13 +1973,16 @@ def print_summary(summary: dict):
     ds = summary["dataset"]
     ins = summary["insert"]
     dlt = summary["delete"]
+    bm_mode = summary.get("benchmark_mode", "full")
 
     print(f"\n{'=' * 78}")
-    print(
-        f"  Dataset: {ds}  |  Docs: {summary['num_docs']}  |  QA/mode: {summary['num_qa_per_mode']}"
-    )
+    header = f"  Dataset: {ds}  |  Docs: {summary['num_docs']}  |  QA/mode: {summary['num_qa_per_mode']}"
+    if bm_mode == "per_question":
+        header += f"  |  Groups: {summary.get('num_groups', '?')}"
+    print(header)
     print(
         f"  Model: {summary['llm_model']}  |  Embedding: {summary['embedding_model']}"
+        f"  |  Mode: {bm_mode}"
     )
     print(f"{'=' * 78}")
     print(f"  Insert:  {ins['time_sec']:.1f}s  | {_fmt_tokens(ins['tokens'])}")
@@ -1776,6 +2054,14 @@ def parse_args():
         default=["local", "global", "hybrid", "naive", "mix"],
         choices=["local", "global", "hybrid", "naive", "mix"],
         help="Query modes to test (default: all five). Example: --query-modes local hybrid mix",
+    )
+    p.add_argument(
+        "--per-question",
+        action="store_true",
+        default=False,
+        help="Per-question mode: for each QA (or group of QAs sharing the same docs), "
+        "insert only the relevant documents, query, then delete. "
+        "QAs with identical doc sets are batched to avoid redundant insertion.",
     )
     p.add_argument(
         "--max-async",
@@ -1895,10 +2181,10 @@ def parse_args():
         help="CLAPNQ data split to use (default: all)",
     )
     p.add_argument(
-        "--clapnq-no-unanswerable",
+        "--clapnq-include-unanswerable",
         action="store_true",
         default=False,
-        help="Exclude unanswerable questions from CLAPNQ benchmark",
+        help="Include unanswerable questions in CLAPNQ benchmark (excluded by default)",
     )
 
     p.add_argument(
@@ -1980,7 +2266,7 @@ async def async_main(args):
             docs = load_clapnq(
                 args.clapnq_path,
                 split=args.clapnq_split,
-                include_unanswerable=not args.clapnq_no_unanswerable,
+                include_unanswerable=args.clapnq_include_unanswerable,
                 doc_ids=args.doc_ids,
                 max_qa=args.max_qa,
             )
@@ -2000,7 +2286,10 @@ async def async_main(args):
             continue
 
         if docs:
-            summary = await run_benchmark_for_dataset(ds, docs, args)
+            if args.per_question:
+                summary = await run_benchmark_per_question(ds, docs, args)
+            else:
+                summary = await run_benchmark_for_dataset(ds, docs, args)
             print_summary(summary)
             all_summaries.append(summary)
 
