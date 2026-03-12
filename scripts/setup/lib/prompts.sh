@@ -17,7 +17,6 @@ mask_sensitive_input() {
   local value
 
   read -r -p "$prompt" value
-  echo >&2
   printf '%s' "$value"
 }
 
@@ -33,7 +32,6 @@ prompt_secret_with_default() {
   else
     read -r -p "$prompt" value
   fi
-  echo >&2
 
   if [[ -z "$value" ]]; then
     value="$default"
@@ -128,6 +126,23 @@ confirm_default_yes() {
   done
 }
 
+confirm_required_yes_no() {
+  local prompt="$1"
+  local response
+
+  while true; do
+    printf '%b' "$prompt [yes/no]: " >&2
+    read -r response
+    case "${response,,}" in
+      yes) return 0 ;;
+      no) return 1 ;;
+      *)
+        echo "Please type 'yes' or 'no'." >&2
+        ;;
+    esac
+  done
+}
+
 prompt_until_valid() {
   local prompt="$1"
   local default="$2"
@@ -213,7 +228,15 @@ prompt_choice() {
     printf '%s\n' "${COLOR_BLUE}${prompt}${COLOR_RESET} options:" >&2
     index=1
     for option in "${options[@]}"; do
-      printf '  %s) %s\n' "${COLOR_GREEN}${index}${COLOR_RESET}" "$option" >&2
+      if [[ "$index" == "$default_index" ]]; then
+        printf '  %s) %s%s%s\n' \
+          "${COLOR_GREEN}${index}${COLOR_RESET}" \
+          "${COLOR_YELLOW}" \
+          "$option" \
+          "${COLOR_RESET}" >&2
+      else
+        printf '  %s) %s\n' "${COLOR_GREEN}${index}${COLOR_RESET}" "$option" >&2
+      fi
       index=$((index + 1))
     done
     if [[ -n "$default_index" ]]; then

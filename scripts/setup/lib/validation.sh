@@ -70,12 +70,6 @@ validate_existing_file() {
   [[ -n "$path" && -f "$path" ]]
 }
 
-validate_mongodb_atlas_uri() {
-  local uri="$1"
-
-  [[ "$uri" =~ ^mongodb\+srv://.+ ]]
-}
-
 check_storage_compatibility() {
   local kv_storage="$1"
   local vector_storage="$2"
@@ -84,7 +78,7 @@ check_storage_compatibility() {
   local warnings=()
 
   if [[ "$vector_storage" == "MongoVectorDBStorage" ]]; then
-    warnings+=("MongoDB vector storage requires Atlas (mongodb+srv:// URI).")
+    warnings+=("MongoDB vector storage requires an Atlas-capable deployment with Atlas Search / Vector Search support.")
   fi
 
   if [[ "$graph_storage" == "Neo4JStorage" && "$kv_storage" == "JsonKVStorage" ]]; then
@@ -210,15 +204,23 @@ validate_required_variables() {
 validate_mongo_vector_storage_config() {
   local vector_storage="$1"
   local mongo_uri="${2:-${ENV_VALUES[MONGO_URI]:-}}"
+  local mongo_deployment="${3:-${ENV_VALUES[LIGHTRAG_SETUP_MONGODB_DEPLOYMENT]:-}}"
 
   if [[ "$vector_storage" != "MongoVectorDBStorage" ]]; then
     return 0
   fi
 
-  if ! validate_mongodb_atlas_uri "$mongo_uri"; then
+  if [[ "$mongo_deployment" == "docker" ]]; then
     format_error \
-      "MongoVectorDBStorage requires a MongoDB Atlas URI." \
-      "Set MONGO_URI to a mongodb+srv:// Atlas connection string or choose another vector backend."
+      "MongoVectorDBStorage cannot use the local Docker MongoDB service managed by this setup wizard." \
+      "That service is MongoDB Community Edition without Atlas Search / Vector Search support. Use an Atlas-capable MongoDB endpoint instead."
+    return 1
+  fi
+
+  if ! validate_uri "$mongo_uri" mongodb; then
+    format_error \
+      "MongoVectorDBStorage requires a valid MongoDB URI." \
+      "Set MONGO_URI to a mongodb:// or mongodb+srv:// endpoint that supports Atlas Search / Vector Search."
     return 1
   fi
 
@@ -253,7 +255,7 @@ validate_auth_accounts_format() {
   return 0
 }
 
-production_whitelist_exposes_api_routes() {
+whitelist_exposes_api_routes() {
   local whitelist_paths="$1"
   local entry trimmed_entry normalized_entry
 
@@ -281,43 +283,10 @@ production_whitelist_exposes_api_routes() {
 validate_security_config() {
   local auth_accounts="${1:-${ENV_VALUES[AUTH_ACCOUNTS]:-}}"
   local token_secret="${2:-${ENV_VALUES[TOKEN_SECRET]:-}}"
-  local api_key="${3:-${ENV_VALUES[LIGHTRAG_API_KEY]:-}}"
-  local require_protection="${4:-no}"
-  local whitelist_paths="${5:-${ENV_VALUES[WHITELIST_PATHS]:-}}"
-  local whitelist_is_set="${6:-}"
-  local effective_whitelist="$whitelist_paths"
-
-  if [[ "${6+x}" == "x" ]]; then
-    if [[ -n "$whitelist_is_set" ]]; then
-      whitelist_is_set="yes"
-    else
-      whitelist_is_set="no"
-    fi
-  elif [[ -z "$whitelist_is_set" ]]; then
-    if [[ "${5+x}" == "x" || -v "ENV_VALUES[WHITELIST_PATHS]" ]]; then
-      whitelist_is_set="yes"
-    else
-      whitelist_is_set="no"
-    fi
-  fi
-
-  if [[ "$require_protection" == "yes" && -z "$auth_accounts" ]]; then
-    format_error \
-      "Production setup requires AUTH_ACCOUNTS." \
-      "Configure account-based auth, optionally add LIGHTRAG_API_KEY on top, or switch to a non-production deployment."
-    return 1
-  fi
-
-  if [[ -n "$auth_accounts" && "$whitelist_is_set" != "yes" ]]; then
-    effective_whitelist="/health,/api/*"
-  fi
-
-  if [[ "$require_protection" == "yes" ]] && production_whitelist_exposes_api_routes "$effective_whitelist"; then
-    format_error \
-      "Production setup must not whitelist /api routes when authentication is enabled." \
-      "Set WHITELIST_PATHS to a minimal list such as /health before using AUTH_ACCOUNTS."
-    return 1
-  fi
+  local _api_key="${3:-${ENV_VALUES[LIGHTRAG_API_KEY]:-}}"
+  local _unused_flag="${4:-no}"
+  local _unused_whitelist="${5:-${ENV_VALUES[WHITELIST_PATHS]:-}}"
+  local _unused_whitelist_is_set="${6:-}"
 
   if [[ -z "$auth_accounts" ]]; then
     return 0
