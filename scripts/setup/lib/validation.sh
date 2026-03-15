@@ -64,6 +64,12 @@ validate_port() {
   return 0
 }
 
+validate_non_empty() {
+  local value="$1"
+
+  [[ -n "$value" ]]
+}
+
 validate_existing_file() {
   local path="$1"
 
@@ -221,6 +227,13 @@ validate_mongo_vector_storage_config() {
     format_error \
       "MongoVectorDBStorage requires a valid MongoDB URI." \
       "Set MONGO_URI to a mongodb:// or mongodb+srv:// endpoint that supports Atlas Search / Vector Search."
+    return 1
+  fi
+
+  if [[ ! "$mongo_uri" =~ ^mongodb\+srv:// ]]; then
+    format_error \
+      "MongoVectorDBStorage requires a MongoDB Atlas URI." \
+      "Set MONGO_URI to a mongodb+srv:// endpoint backed by Atlas Search / Vector Search."
     return 1
   fi
 
